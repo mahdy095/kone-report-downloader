@@ -320,11 +320,10 @@ def _results_df(results: list) -> pd.DataFrame:
             if r["files"] else "—"
         )
         rows.append({
-            "MSG File":    r["msg_file"],
-            "Address":     r["address"],
-            "Status":      label,
-            "PDFs":        r["count"],
-            "Files":       files_str,
+            "MSG File": r["msg_file"],
+            "Status":   label,
+            "PDFs":     r["count"],
+            "Files":    files_str,
         })
     return pd.DataFrame(rows)
 
