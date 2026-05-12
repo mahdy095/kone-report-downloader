@@ -518,16 +518,7 @@ def main():
         return
 
     st.markdown("---")
-    col_btn, col_est = st.columns([1, 3])
-    with col_btn:
-        start = st.button("🚀 Start Download", type="primary")
-    with col_est:
-        est_min = max(1, len(valid_jobs) * 30 // 60)
-        st.markdown(
-            f"<br>Estimated time: <strong>~{est_min}–{est_min * 2} minutes</strong> "
-            f"for {len(valid_jobs)} file(s)",
-            unsafe_allow_html=True,
-        )
+    start = st.button("🚀 Start Download", type="primary")
 
     if start:
         temp_dir = tempfile.mkdtemp()
