@@ -37,7 +37,7 @@ st.set_page_config(
     page_title="KONE Report Downloader",
     page_icon="📥",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -52,15 +52,8 @@ st.markdown("""
     min-height: 100vh;
 }
 
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #1a1f36 0%, #0f1419 100%) !important;
-}
-[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
-[data-testid="stSidebar"] h1,
-[data-testid="stSidebar"] h2,
-[data-testid="stSidebar"] h3 { color: #ffffff !important; font-weight: 600 !important; }
-[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.15) !important; }
-[data-testid="stSidebar"] .stMarkdown a { color: #a5b4fc !important; }
+[data-testid="stSidebar"] { display: none !important; }
+[data-testid="collapsedControl"] { display: none !important; }
 
 .hero-section {
     background: linear-gradient(135deg, #6366f1 0%, #4f46e5 50%, #4338ca 100%);
@@ -366,41 +359,10 @@ def main():
     chromium_ok, chromium_log = _install_chromium()
     _init_state()
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("## 📥 KONE Downloader")
-        st.markdown("---")
-
-        st.markdown("### System Status")
-        if chromium_ok:
-            st.markdown('<span class="status-dot dot-green"></span>Chromium ready', unsafe_allow_html=True)
-        else:
-            st.markdown('<span class="status-dot dot-red"></span>Chromium unavailable', unsafe_allow_html=True)
-        st.markdown("---")
-
-        st.markdown("### How to use")
-        st.markdown("""
-1. Upload up to **50 .msg files**
-2. Check the URL extraction preview
-3. Click **Start Download**
-4. Wait for all jobs to finish
-5. Download the **ZIP** with all PDFs
-""")
-        st.markdown("---")
-
-        st.markdown("### Notes")
-        st.markdown("""
-- KONE links expire — use **recent** emails
-- One .msg can produce **multiple PDFs**
-- 50 files may take **15–30 min**
-- Keep the browser tab open while processing
-""")
-
     # ── Hero ──────────────────────────────────────────────────────────────────
     st.markdown("""
 <div class="hero-section">
     <h1>📥 KONE Service Report Downloader</h1>
-    <p>Upload your KONE notification emails — we'll fetch all PDF reports automatically</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -505,16 +467,10 @@ def main():
         "Drag & drop your KONE service-update emails here (max 50)",
         type=["msg"],
         accept_multiple_files=True,
+        label_visibility="collapsed",
     )
 
     if not uploaded:
-        st.markdown("""
-<div class="info-box">
-    👆 Upload your <strong>KONE Ihr Service-Update</strong> .msg files above.<br>
-    The app will open each link, click the download button and collect all PDFs.<br>
-    Maximum <strong>50 files</strong> per batch.
-</div>
-""", unsafe_allow_html=True)
         return
 
     if len(uploaded) > MAX_FILES:
