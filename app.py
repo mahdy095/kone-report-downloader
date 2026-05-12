@@ -46,6 +46,7 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
 * { font-family: 'Inter', sans-serif !important; }
+[data-testid="stIconMaterial"] { font-family: 'Material Symbols Rounded' !important; }
 
 [data-testid="stAppViewContainer"] {
     background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
@@ -492,9 +493,8 @@ def main():
         url     = extract_url(uf.getvalue())
         jobs.append((address, url, uf.name))
         preview_rows.append({
-            "MSG File":          uf.name,
-            "Address / Building": address,
-            "URL Found":         "✓ Yes" if url else "✗ No",
+            "MSG File":  uf.name,
+            "URL Found": "✓ Yes" if url else "✗ No",
         })
 
     st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
