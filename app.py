@@ -176,7 +176,15 @@ STATUS_META = {
 # ── Core helpers ──────────────────────────────────────────────────────────────
 
 def extract_url(msg_bytes: bytes) -> str | None:
-    """Extract the Jobdetails URL from raw .msg bytes."""
+    """
+    Extract the Jobdetails URL from raw .msg bytes.
+    Handles three email variants:
+      1. Direct KONE link  — <a href="https://click.hello.kone.com/...">Jobdetails</a>
+      2. SafeLinks forward — href is safelinks wrapper, but originalsrc holds the real URL
+      3. SafeLinks + span  — text is inside a <span>; decode SafeLinks href as fallback
+    """
+    from urllib.parse import urlparse, parse_qs, unquote
+
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as tmp:
@@ -184,11 +192,41 @@ def extract_url(msg_bytes: bytes) -> str | None:
             tmp_path = tmp.name
         msg = _extract_msg.Message(tmp_path)
         html = (msg.htmlBody or b"").decode("utf-8", errors="ignore")
-        match = re.search(
+
+        # Strategy 1: original format — plain Jobdetails text directly in <a>
+        m = re.search(
             r'<a\s+href=["\']([^"\']+)["\'][^>]*>\s*Jobdetails\s*</a>',
             html, re.IGNORECASE,
         )
-        return match.group(1) if match else None
+        if m:
+            return m.group(1)
+
+        # Strategy 2: forwarded/SafeLinks emails — Outlook stores the original URL
+        # in an `originalsrc` attribute on the <a> tag
+        m = re.search(
+            r'originalsrc=["\']([^"\']*click\.hello\.kone\.com[^"\']*)["\']',
+            html, re.IGNORECASE,
+        )
+        if m:
+            return m.group(1)
+
+        # Strategy 3: Jobdetails text wrapped in inner tags (e.g. <span>),
+        # href is a SafeLinks URL — decode the inner `url=` parameter
+        m = re.search(
+            r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(?:<[^>]+>)*\s*Jobdetails\s*(?:</[^>]+>)*</a>',
+            html, re.IGNORECASE,
+        )
+        if m:
+            url = m.group(1)
+            if "safelinks.protection.outlook.com" in url:
+                clean = url.replace("&amp;", "&")
+                parsed = urlparse(clean)
+                inner = parse_qs(parsed.query).get("url", [None])[0]
+                if inner:
+                    return unquote(inner)
+            return url
+
+        return None
     except Exception:
         return None
     finally:
