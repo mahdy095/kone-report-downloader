@@ -175,17 +175,37 @@ STATUS_META = {
 
 # ── Core helpers ──────────────────────────────────────────────────────────────
 
+# The report link's visible text differs by portal language:
+#   German → "Jobdetails"   |   Dutch → "Statusinformatie"
+REPORT_LINK_TEXTS = ("jobdetails", "statusinformatie")
+
+
+def _url_from_anchor_attrs(attrs: str) -> str | None:
+    """Extract the real KONE URL from an <a> tag's attributes."""
+    from urllib.parse import urlparse, parse_qs, unquote
+    # Forwarded via Outlook SafeLinks — the original URL is in `originalsrc`.
+    o = re.search(r'originalsrc=["\']([^"\']*click\.hello\.kone\.com[^"\']*)["\']', attrs, re.IGNORECASE)
+    if o:
+        return o.group(1)
+    h = re.search(r'href=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+    if h:
+        url = h.group(1).replace("&amp;", "&")
+        if "safelinks.protection.outlook.com" in url:
+            inner = parse_qs(urlparse(url).query).get("url", [None])[0]
+            if inner:
+                return unquote(inner)
+        return url
+    return None
+
+
 def extract_url(msg_bytes: bytes) -> str | None:
     """
-    Extract the Jobdetails URL from raw .msg bytes.
-    Handles three email variants:
-      1. Direct KONE link  — <a href="https://click.hello.kone.com/...">Jobdetails</a>
-      2. SafeLinks forward — href is safelinks wrapper, but originalsrc holds the real URL
-      3. SafeLinks + span  — text is inside a <span>; decode SafeLinks href as fallback
+    Extract the KONE service-report URL from raw .msg bytes.
+    Works for both German ("Jobdetails") and Dutch ("Statusinformatie") emails,
+    whether sent directly or forwarded through Outlook SafeLinks.
     """
-    from urllib.parse import urlparse, parse_qs, unquote
-
     tmp_path = None
+    msg = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as tmp:
             tmp.write(msg_bytes)
@@ -193,16 +213,18 @@ def extract_url(msg_bytes: bytes) -> str | None:
         msg = _extract_msg.Message(tmp_path)
         html = (msg.htmlBody or b"").decode("utf-8", errors="ignore")
 
-        # Strategy 1: original format — plain Jobdetails text directly in <a>
-        m = re.search(
-            r'<a\s+href=["\']([^"\']+)["\'][^>]*>\s*Jobdetails\s*</a>',
-            html, re.IGNORECASE,
-        )
-        if m:
-            return m.group(1)
+        # Primary: find the anchor whose visible text is the report link
+        # ("Jobdetails" / "Statusinformatie") and pull its URL. This targets the
+        # correct link even when the email has several KONE links (footer, etc.).
+        for a in re.finditer(r'<a\b([^>]*)>(.*?)</a>', html, re.IGNORECASE | re.DOTALL):
+            attrs, inner = a.group(1), a.group(2)
+            text = re.sub(r'<[^>]+>', '', inner).strip().lower()
+            if text in REPORT_LINK_TEXTS:
+                url = _url_from_anchor_attrs(attrs)
+                if url:
+                    return url
 
-        # Strategy 2: forwarded/SafeLinks emails — Outlook stores the original URL
-        # in an `originalsrc` attribute on the <a> tag
+        # Fallback: first KONE click-link preserved in an `originalsrc` attribute.
         m = re.search(
             r'originalsrc=["\']([^"\']*click\.hello\.kone\.com[^"\']*)["\']',
             html, re.IGNORECASE,
@@ -210,32 +232,38 @@ def extract_url(msg_bytes: bytes) -> str | None:
         if m:
             return m.group(1)
 
-        # Strategy 3: Jobdetails text wrapped in inner tags (e.g. <span>),
-        # href is a SafeLinks URL — decode the inner `url=` parameter
-        m = re.search(
-            r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(?:<[^>]+>)*\s*Jobdetails\s*(?:</[^>]+>)*</a>',
-            html, re.IGNORECASE,
-        )
-        if m:
-            url = m.group(1)
-            if "safelinks.protection.outlook.com" in url:
-                clean = url.replace("&amp;", "&")
-                parsed = urlparse(clean)
-                inner = parse_qs(parsed.query).get("url", [None])[0]
-                if inner:
-                    return unquote(inner)
-            return url
-
         return None
     except Exception:
         return None
     finally:
+        # Close the message first so the temp file can be removed on Windows too.
+        if msg is not None:
+            try:
+                msg.close()
+            except Exception:
+                pass
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def safe_name(text: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "-", text)
+
+
+def address_from_filename(filename: str) -> str:
+    """
+    Derive the building address from a .msg filename, handling both languages
+    and forwarded/replied prefixes:
+      "Ihr Service-Update _ Eifelplatz 17.msg"              -> "Eifelplatz 17"
+      "FW_ Servicebezoek afgerond _ Stationsplein 52.msg"  -> "Stationsplein 52"
+    """
+    name = re.sub(r'\.msg$', '', filename, flags=re.IGNORECASE)
+    name = re.sub(r'^(FW|FWD|WG|RE|AW)_\s*', '', name, flags=re.IGNORECASE)   # forward/reply prefixes
+    name = re.sub(r'^(Ihr Service-Update|Servicebezoek afgerond)\s*_\s*', '', name, flags=re.IGNORECASE)
+    return name.strip()
 
 
 async def _download_job(page, address: str, url: str, temp_dir: str):
@@ -257,8 +285,11 @@ async def _download_job(page, address: str, url: str, temp_dir: str):
         if "redirect_error" in page.url:
             return [], "expired"
 
+        # Wait for the download icon itself — it is the same image on the German
+        # ("Den Report runterladen") and Dutch ("Download het servicerapport")
+        # portals, so this is language-independent.
         try:
-            await page.wait_for_selector("text=Den Report runterladen", timeout=25_000)
+            await page.wait_for_selector("img[src*='KONE_download']", timeout=25_000)
         except PWTimeout:
             return [], "no_button"
 
@@ -526,7 +557,7 @@ def main():
     preview_rows = []
 
     for uf in uploaded:
-        address = uf.name.replace("Ihr Service-Update _ ", "").replace(".msg", "").strip()
+        address = address_from_filename(uf.name)
         url     = extract_url(uf.getvalue())
         jobs.append((address, url, uf.name))
         preview_rows.append({
@@ -546,13 +577,14 @@ def main():
 
     if invalid_count > 0:
         st.markdown(
-            f'<div class="warn-box">⚠️ {invalid_count} file(s) contain no Jobdetails link '
-            f'and will be skipped.</div>',
+            f'<div class="warn-box">⚠️ {invalid_count} file(s) contain no KONE report link '
+            f'(Jobdetails / Statusinformatie) and will be skipped.</div>',
             unsafe_allow_html=True,
         )
 
     if not valid_jobs:
-        st.error("No valid URLs found. Make sure you're uploading KONE service-update emails with a Jobdetails link.")
+        st.error("No valid URLs found. Make sure you're uploading KONE service emails "
+                 "(German 'Jobdetails' or Dutch 'Statusinformatie' report link).")
         return
 
     st.markdown("---")
