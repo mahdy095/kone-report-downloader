@@ -21,16 +21,139 @@ import pandas as pd
 import extract_msg as _extract_msg
 
 # ── Chromium installation (cached, runs once per deployment) ──────────────────
+# Streamlit Community Cloud's apt step (packages.txt) is unusable: the platform
+# image still lists the EOL bullseye-security repo, whose Release file expired,
+# so `apt-get update` exits non-zero and the whole deployment is refused.
+# The shared libraries Chromium needs are therefore installed here at runtime,
+# without root: apt resolves and downloads the .deb files (read-only operations
+# a normal user may run), they are unpacked into a private prefix, and that
+# prefix is exposed to Chromium through LD_LIBRARY_PATH.
+
+_LIB_PREFIX = Path.home() / ".cache" / "chromium-sysdeps"
+
+# Debian Trixie names — the *t64 variants, see PROJECT_CONTEXT.md
+_CHROMIUM_SYSDEPS = [
+    "libnss3", "libnspr4", "libatk1.0-0t64", "libatk-bridge2.0-0t64",
+    "libatspi2.0-0t64", "libcups2t64", "libdrm2", "libxkbcommon0", "libgbm1",
+    "libasound2t64", "libx11-xcb1", "libxcomposite1", "libxdamage1",
+    "libxfixes3", "libxrandr2", "libpango-1.0-0", "libcairo2", "libdbus-1-3",
+]
+
+
+def _lib_env() -> dict:
+    """LD_LIBRARY_PATH pointing at the private prefix (empty if nothing there)."""
+    dirs = [
+        str(p) for p in (
+            _LIB_PREFIX / "usr" / "lib" / "x86_64-linux-gnu",
+            _LIB_PREFIX / "lib" / "x86_64-linux-gnu",
+            _LIB_PREFIX / "usr" / "lib",
+        ) if p.is_dir()
+    ]
+    if not dirs:
+        return {}
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    return {"LD_LIBRARY_PATH": ":".join(dirs + ([current] if current else []))}
+
+
+def _chromium_binaries() -> list:
+    root = Path.home() / ".cache" / "ms-playwright"
+    found = list(root.glob("chromium-*/chrome-linux*/chrome"))
+    found += list(root.glob("chromium_headless_shell-*/chrome-linux*/headless_shell"))
+    return [p for p in found if p.is_file()]
+
+
+def _missing_libs(binaries) -> list:
+    """Shared libraries Chromium asks for but cannot find, via ldd."""
+    missing = set()
+    for binary in binaries:
+        out = subprocess.run(
+            ["ldd", str(binary)], capture_output=True, text=True, timeout=60,
+            env={**os.environ, **_lib_env()},
+        ).stdout
+        for line in out.splitlines():
+            if "not found" in line:
+                missing.add(line.split("=>")[0].strip())
+    return sorted(missing)
+
+
+def _install_sysdeps() -> str:
+    """Unpack Chromium's shared libraries into _LIB_PREFIX without root."""
+    log = []
+    debs = _LIB_PREFIX / "debs"
+    debs.mkdir(parents=True, exist_ok=True)
+
+    # Full dependency closure — apt-cache is read-only, no root needed
+    dep = subprocess.run(
+        ["apt-cache", "depends", "--recurse", "--no-recommends", "--no-suggests",
+         "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances",
+         *_CHROMIUM_SYSDEPS],
+        capture_output=True, text=True, timeout=180,
+    )
+    names = sorted({
+        line.strip() for line in dep.stdout.splitlines()
+        if line and not line[0].isspace() and "<" not in line
+    })
+    if not names:
+        return "apt-cache depends returned nothing:\n" + (dep.stdout + dep.stderr).strip()
+    log.append(f"resolving {len(names)} packages")
+
+    # apt-get download writes into the cwd and needs no root either
+    for i in range(0, len(names), 40):
+        chunk = names[i:i + 40]
+        res = subprocess.run(
+            ["apt-get", "download", *chunk], cwd=str(debs),
+            capture_output=True, text=True, timeout=900,
+        )
+        if res.returncode != 0:
+            # one bad name must not sink the whole chunk
+            for name in chunk:
+                subprocess.run(
+                    ["apt-get", "download", name], cwd=str(debs),
+                    capture_output=True, text=True, timeout=300,
+                )
+
+    archives = list(debs.glob("*.deb"))
+    log.append(f"downloaded {len(archives)} .deb files")
+    for deb in archives:
+        subprocess.run(
+            ["dpkg-deb", "-x", str(deb), str(_LIB_PREFIX)],
+            capture_output=True, text=True, timeout=120,
+        )
+    return "\n".join(log)
+
+
 @st.cache_resource(show_spinner=False)
 def _install_chromium():
+    log = []
     try:
         result = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, timeout=300,
         )
-        return result.returncode == 0, (result.stdout + result.stderr).strip()
+        log.append((result.stdout + result.stderr).strip())
+        if result.returncode != 0:
+            return False, "\n".join(log)
+
+        os.environ.update(_lib_env())
+        binaries = _chromium_binaries()
+        if not binaries:
+            log.append("No Chromium binary found under ~/.cache/ms-playwright")
+            return False, "\n".join(log)
+
+        missing = _missing_libs(binaries)
+        if missing:
+            log.append("Missing shared libraries: " + ", ".join(missing))
+            log.append(_install_sysdeps())
+            os.environ.update(_lib_env())
+            missing = _missing_libs(binaries)
+            if missing:
+                log.append("Still missing after local install: " + ", ".join(missing))
+                return False, "\n".join(log)
+            log.append(f"Shared libraries installed into {_LIB_PREFIX}")
+        return True, "\n".join(log)
     except Exception as exc:
-        return False, str(exc)
+        log.append(str(exc))
+        return False, "\n".join(log)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(

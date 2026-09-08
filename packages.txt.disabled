@@ -1,0 +1,19 @@
+# DISABLED 2026-09-08 - do not restore as packages.txt.
+# Streamlit Community Cloud refuses any deployment that has a packages.txt:
+# its image still lists the EOL bullseye-security repo, whose Release file has
+# expired, so apt-get update exits non-zero and the build is aborted.
+# These libraries are now installed at runtime by _install_chromium() in app.py.
+libnss3
+libnspr4
+libatk1.0-0
+libatk-bridge2.0-0
+libcups2
+libdrm2
+libxkbcommon0
+libgbm1
+libasound2
+libx11-xcb1
+libxcomposite1
+libxdamage1
+libxfixes3
+libxrandr2

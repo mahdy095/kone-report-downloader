@@ -32,7 +32,43 @@ kone_downloader/
 - **Auto-deploy:** pushes to `main` branch trigger redeployment automatically
 - **No secrets needed** — app has no API key
 
-### packages.txt (system libs for Chromium on Debian Trixie)
+### packages.txt is DISABLED (2026-09-08) — apt is broken on Community Cloud
+
+Streamlit Community Cloud aborts the deployment of any repo that contains a
+`packages.txt`:
+
+```
+E: Release file for http://deb.debian.org/debian-security/dists/bullseye-security/InRelease is expired
+   installer returned a non-zero exit code
+   Error during processing dependencies!
+```
+
+The platform image still carries `bullseye-security` (and `packages.microsoft.com/debian/11`)
+in its sources list. Debian bullseye LTS ended 2026-08-31, so that Release file is
+permanently expired, `apt-get update` exits non-zero, and Streamlit treats the whole
+dependency step as failed. Nothing in the repo can fix apt's sources — restarting the
+app does not help either.
+
+Fix: the file was renamed to `packages.txt.disabled` (apt is then never invoked) and
+`_install_chromium()` in `app.py` installs Chromium's shared libraries at runtime
+**without root**:
+
+1. `playwright install chromium` as before.
+2. `ldd` the Chromium/headless-shell binary — if nothing is missing, stop here (the
+   base image may already carry the libs, so this costs nothing).
+3. Otherwise `apt-cache depends --recurse` for the dependency closure and
+   `apt-get download` for the `.deb` files — both read-only apt operations that a
+   non-root user may run, and neither touches `apt-get update`.
+4. `dpkg-deb -x` each archive into `~/.cache/chromium-sysdeps`, then expose
+   `usr/lib/x86_64-linux-gnu` (etc.) through `LD_LIBRARY_PATH` before Playwright
+   starts. Playwright inherits `os.environ`, so the background thread sees it.
+5. `ldd` again; if libraries are still missing the app shows the full log in the
+   "Technical details" expander instead of failing silently.
+
+If Streamlit ever repairs the image, the old file can be restored verbatim — the
+runtime path then becomes a no-op because step 2 finds nothing missing.
+
+### packages.txt, historical (system libs for Chromium on Debian Trixie)
 
 Critical lesson: Streamlit Cloud runs Debian Trixie which uses `*t64` renamed packages. Do **not** include `libglib2.0-0` — it conflicts with the Trixie `libglib2.0-0t64` variant pulled in by `libatk1.0-0`. The working set:
 
