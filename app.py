@@ -134,6 +134,11 @@ def _install_chromium():
         if result.returncode != 0:
             return False, "\n".join(log)
 
+        # The ldd / .deb dance below is only meaningful on the Linux host of
+        # Streamlit Cloud; a local Windows or macOS run stops here.
+        if sys.platform != "linux":
+            return True, "\n".join(log)
+
         os.environ.update(_lib_env())
         binaries = _chromium_binaries()
         if not binaries:
