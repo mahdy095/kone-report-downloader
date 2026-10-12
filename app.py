@@ -4,6 +4,8 @@ Upload .msg notification emails → download all PDF reports → get a ZIP file.
 """
 
 import re
+import json
+import base64
 import asyncio
 import threading
 import tempfile
@@ -394,10 +396,35 @@ def address_from_filename(filename: str) -> str:
     return name.strip()
 
 
+def _reports_from_aura(body: str) -> list:
+    """
+    PDFs embedded in the portal's getServiceReport Aura response, as
+    [(filename, pdf_bytes), ...]. The server returns each report as base64 in
+    `documentBody`; the page itself only wraps that in a download link.
+    """
+    from urllib.parse import unquote
+    data = json.loads(body[body.index("{"):])          # tolerate a while(1); prefix
+    reports = []
+    for action in data.get("actions", []):
+        if action.get("state") != "SUCCESS":
+            continue
+        for rep in action.get("returnValue") or []:
+            b64 = unquote(rep.get("documentBody") or "")  # the page decodes it the same way
+            if b64:
+                reports.append((rep.get("name") or "report.pdf", base64.b64decode(b64)))
+    return reports
+
+
 async def _download_job(page, address: str, url: str, temp_dir: str):
     """
-    Navigate to a KONE Jobdetails page and download all triggered PDFs.
+    Navigate to a KONE Jobdetails page and save all PDFs behind its download icon.
     Returns (list_of_saved_file_info, status_string).
+
+    Since Oct 2026 the portal's own download button no longer works: its script
+    builds a `data:` link, which Salesforce Lightning Web Security blocks, so the
+    browser never starts a download. The PDFs are therefore read straight from
+    the getServiceReport response the click triggers. A real browser download
+    is still accepted as a fallback in case KONE changes the page.
     """
     from playwright.async_api import TimeoutError as PWTimeout
 
@@ -422,33 +449,48 @@ async def _download_job(page, address: str, url: str, temp_dir: str):
             return [], "no_button"
 
         await page.wait_for_timeout(1_500)
-        await page.click("img[src*='KONE_download']", timeout=10_000)
+        async with page.expect_response(
+            lambda r: "getServiceReport" in r.url, timeout=30_000
+        ) as resp_info:
+            await page.click("img[src*='KONE_download']", timeout=10_000)
+        response = await resp_info.value
+        reports = _reports_from_aura(await response.text())
 
-        # Poll until no new download arrives for 3 consecutive seconds (max 20 s total).
-        deadline, poll = 20, 0.5
-        stable_for = last_count = 0
-        for _ in range(int(deadline / poll)):
-            await asyncio.sleep(poll)
-            if len(collected) > last_count:
-                last_count = len(collected)
-                stable_for = 0
-            else:
-                stable_for += poll
-                if stable_for >= 3 and last_count > 0:
-                    break
+        files = []   # (suggested_name, save(path) — sync or async)
+        if reports:
+            for name, pdf in reports:
+                files.append((name, lambda path, pdf=pdf: Path(path).write_bytes(pdf)))
+        else:
+            # Fallback: a browser download, should the button ever work again.
+            # Poll until no new download arrives for 3 consecutive seconds (max 10 s).
+            deadline, poll = 10, 0.5
+            stable_for = last_count = 0
+            for _ in range(int(deadline / poll)):
+                await asyncio.sleep(poll)
+                if len(collected) > last_count:
+                    last_count = len(collected)
+                    stable_for = 0
+                else:
+                    stable_for += poll
+                    if stable_for >= 3 and last_count > 0:
+                        break
+            for i, dl in enumerate(collected):
+                files.append((dl.suggested_filename or f"report_{i+1}.pdf", dl.save_as))
 
-        if not collected:
+        if not files:
             return [], "no_download"
 
         saved = []
-        for i, dl in enumerate(collected):
-            suggested = dl.suggested_filename or f"report_{i+1}.pdf"
-            if len(collected) > 1:
+        for i, (suggested, save) in enumerate(files):
+            suggested = safe_name(suggested)
+            if len(files) > 1:
                 stem, ext = suggested.rsplit(".", 1) if "." in suggested else (suggested, "pdf")
                 suggested = f"{stem}_{i+1}.{ext}"
             fname = f"{safe_name(address)}_{suggested}"
             save_path = os.path.join(temp_dir, fname)
-            await dl.save_as(save_path)
+            result = save(save_path)
+            if asyncio.iscoroutine(result):
+                await result
             size_kb = os.path.getsize(save_path) // 1024
             saved.append({"filename": fname, "size_kb": size_kb})
 
