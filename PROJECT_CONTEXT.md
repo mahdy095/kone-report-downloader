@@ -348,7 +348,9 @@ The report pages come in **two label languages**, also mixed within one batch (s
 The **cover can list orders that have no report pages** in the PDF: status seen `Geplant` (planned Störung),
 `Angekommen` (Inspektion in progress). Status `Unterschrift` did have a report. So the status says nothing reliable
 about presence. Report types seen: Planned Maintenance (1–3 pages), Repair (1–2), Störung (2), Inspektion. Order
-numbers are 12 characters, digits or `9B…`. A cover with only one report = a single report (not split). The same
+numbers are 12 characters, digits or `9B…` (the pattern `[0-9A-Z]{6,}` = at least 6, no upper limit). A cover
+with only one report = a single report: not listed as collective, but its cover is split off too (plan with one
+part, 10 of the 11 real singles; the old format without cover stays as it is). The same
 email can arrive twice → byte-identical PDFs.
 
 **Detection + plan** — `collective_parts(pdf_path, di)` → plan dict `{parts, cover, problem, not_in_pdf, ocr_pages}`,
@@ -392,8 +394,9 @@ report, re-generated copy with new font tags) and 16 synthetic cases without fon
 
 **Split** — `split_collective(pdf, plan, out_dir, address, seen)`, only when the user clicks the button. Output in
 `temp_dir/split/` = the full set: every collective PDF cut into its reports **plus its cover as its own file**
-(`<address>_Deckblatt.pdf` — the cover can hold the only customer signature, seen 1 of 11), every
-other PDF copied unchanged. Each PDF is split all-or-nothing (pieces built in memory first); a PDF whose split fails
+(`<address>_Deckblatt.pdf` — the cover can hold the only customer signature, seen 1 of 11); every single report
+with a cover likewise as report + `_Deckblatt.pdf` (user request 03.11: all reports treated alike); every other
+PDF (no cover, could not be split, could not be read) copied unchanged. Each PDF is split all-or-nothing (pieces built in memory first); a PDF whose split fails
 is copied whole and listed in a warning — the rest still splits. Report file name = KONE's single-report pattern +
 order number, with the lift's **own street from the report** (the email subject only names one address of the visit):
 ```

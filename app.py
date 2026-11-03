@@ -601,7 +601,9 @@ def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
        "problem_kind": "unclear" | "missing" | "scanned", "problem_order": order no. for "missing",
        "not_in_pdf": cover orders without report pages, e.g. "9B0000000001 (Störung, Geplant)",
        "ocr_pages": [page indices read by OCR]}
-    "parts" is empty for a single report and whenever there is a problem —
+    Two or more parts = a collective report. A single report with a cover page
+    gets one part, so its cover can be split off the same way; a single report
+    without cover has none. "parts" is also empty whenever there is a problem —
     better not to cut than to cut wrong. `di` = Azure Document Intelligence
     credentials {"endpoint", "key"} for pages without a text layer.
     """
@@ -709,8 +711,8 @@ def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
                 if owner.get(i) != o and _mentions(texts[i], o):
                     return refuse(f"order {o} appears on page {i + 1}, outside its own report")
 
-    if len(starts) < 2:
-        return plan   # a single report
+    if not starts or (len(starts) == 1 and not (cover and first)):
+        return plan   # a single report without cover page: nothing to split off
 
     plan["cover"] = list(range(first))
     for start, order in starts:
@@ -1088,7 +1090,8 @@ def main():
 
         # ── Optional post step: split collective reports ──────────────────────
         files      = [(r, f) for r in results for f in r["files"]]
-        collective = [(r, f) for r, f in files if f.get("plan") and f["plan"]["parts"]]
+        # 2+ parts = collective report; 1 part = single report whose cover page is split off too
+        collective = [(r, f) for r, f in files if f.get("plan") and len(f["plan"]["parts"]) >= 2]
         unclear    = [f for _, f in files if f.get("plan") and f["plan"]["problem"]]
         unchecked  = [f for _, f in files if f.get("read_error")]
         if collective or unclear or unchecked:
@@ -1101,7 +1104,8 @@ def main():
                     f'zusammen <strong>{_n(len(orders), "Einzelbericht", "Einzelberichte")}</strong>. '
                     f'Mit „Sammelberichte aufteilen“ bekommst du jeden Bericht als eigene PDF, dazu das '
                     f'Deckblatt jedes Termins (darauf steht oft die Kundenunterschrift). Das ZIP enthält '
-                    f'außerdem alle anderen Berichte unverändert – danach brauchst du nur dieses eine ZIP. '
+                    f'außerdem alle anderen Berichte – auch bei ihnen wird das Deckblatt abgetrennt, '
+                    f'Berichte ohne Deckblatt bleiben unverändert. Danach brauchst du nur dieses eine ZIP. '
                     f'Die ursprünglichen PDFs kannst du oben weiterhin herunterladen.</div>',
                     unsafe_allow_html=True,
                 )

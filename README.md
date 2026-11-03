@@ -8,7 +8,9 @@ Upload KONE service-update emails (`.msg`) and get every service-report PDF back
   (Outlook SafeLinks)
 - **Collective reports:** when KONE sends one PDF for a whole site visit, the results page offers
   "Sammelberichte aufteilen". You get a second ZIP with one PDF per order (Auftragsnr.) plus each visit's cover
-  page (`…_Deckblatt.pdf`, it can hold the customer signature), and the original ZIP stays available.
+  page (`…_Deckblatt.pdf`, it can hold the customer signature), and the original ZIP stays available. That ZIP
+  holds every report: single reports with a cover page get their cover split off the same way, reports without
+  one are copied unchanged.
 - **User interface:** German, written for non-technical users; technical reasons (why a PDF was not split, read
   errors) go to the server log only (Streamlit Cloud → Manage app → logs).
 - **"🐞 Problem melden"** (bottom right, every screen) opens a new email in the default mail app (Outlook) to
