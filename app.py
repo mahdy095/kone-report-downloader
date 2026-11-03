@@ -10,6 +10,7 @@ import asyncio
 import threading
 import tempfile
 import io
+import hashlib
 import zipfile
 import os
 import time
@@ -21,6 +22,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import extract_msg as _extract_msg
+from pypdf import PdfReader, PdfWriter
 
 # ── Chromium installation (cached, runs once per deployment) ──────────────────
 # Streamlit Community Cloud's apt step (packages.txt) is unusable: the platform
@@ -380,7 +382,7 @@ def extract_url(msg_bytes: bytes) -> str | None:
 
 
 def safe_name(text: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]', "-", text)
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", text)
 
 
 def address_from_filename(filename: str) -> str:
@@ -415,7 +417,352 @@ def _reports_from_aura(body: str) -> list:
     return reports
 
 
-async def _download_job(page, address: str, url: str, temp_dir: str):
+# ── Collective reports ────────────────────────────────────────────────────────
+# Since Oct 2026 KONE often sends one PDF per site visit instead of one per
+# order: a "Site Visit Service Report" cover page listing every order of the
+# visit, then one "Service Report" per order. KONE builds that PDF by merging
+# one PDF per report. The cover is German; the report pages come with German or
+# English labels. The cover can also list orders that are not finished yet
+# (status "Geplant", "Angekommen") and have no report pages in the PDF.
+#
+# Where each report starts is decided by independent witnesses, the first two
+# of which do not depend on any label wording:
+#   1. order numbers: the cover table is read by its column layout, and a report
+#      starts on the page whose details block names its order and its lift on
+#      one line;
+#   2. fonts: every merged report brings its own font subset tags, so a page
+#      that shares no tag with the page before is the first page of a report;
+#   3. labels ("Auftragsnr." / "Service Order"), where recognised.
+# A PDF is cut only when the witnesses agree; otherwise it stays whole and the
+# user is told why. Pages without a text layer are read with Azure Document
+# Intelligence (OCR) when its credentials are configured.
+
+_ORDER_NO    = re.compile(r'[0-9A-Z]{6,}')
+_ORDER_START = re.compile(r'^\s*(?:Auftragsnr\.|Service Order)\s+([0-9A-Z]{6,})\b', re.MULTILINE)
+_LABELS = {   # report-page labels: German, English
+    "street":     ("Straße", "Street"),
+    "asset":      ("Vermögenswert", "Equipment"),
+    "visit_type": ("Auftragsgrund", "Customer Facing"),
+}
+# Cover statuses seen on orders that have no report pages yet. A cover order
+# with any other status ("Abgeschlossen", "Unterschrift", …) must have a report.
+_OPEN_STATUSES = {"geplant", "angekommen"}
+
+
+def _layout_field(text: str, labels: tuple) -> str:
+    """Value right of the first label found in pypdf's layout text ("Straße      Musterstraße 1")."""
+    for label in labels:
+        m = re.search(rf'{re.escape(label)} {{2,}}(\S.*?)(?: {{2,}}|$)', text, re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _mentions(text: str, order: str) -> bool:
+    """True when the order number stands in the text on its own, not inside a longer number."""
+    return re.search(rf'(?<![0-9]){re.escape(order)}(?![0-9])', text) is not None
+
+
+def _font_tags(page) -> frozenset:
+    """Subset tags of the fonts a page uses ("ABCDEF" of "ABCDEF+ArialMT")."""
+    tags = set()
+    try:
+        res = page.get("/Resources")
+        fonts = res.get_object().get("/Font") if res else None
+        for ref in (fonts.get_object().values() if fonts else []):
+            base = str(ref.get_object().get("/BaseFont") or "")
+            if "+" in base:
+                tags.add(base.lstrip("/").split("+")[0])
+    except Exception:
+        pass
+    return frozenset(tags)
+
+
+def _merge_boundaries(page_tags: list) -> list:
+    """
+    Pages that share no font tag with the last page before them that used fonts:
+    the first page of each PDF KONE merged in. Pages without fonts are skipped.
+    """
+    bounds, last = [], None
+    for i, tags in enumerate(page_tags):
+        if not tags:
+            continue
+        if last is not None and not (tags & last):
+            bounds.append(i)
+        last = tags
+    return bounds
+
+
+def _ocr_layout_texts(pdf_path: str, page_idxs: list, di: dict) -> dict:
+    """
+    {page index: text} of the given pages, read by Azure Document Intelligence
+    ("prebuilt-read") and rebuilt line by line in the style of pypdf's layout
+    mode: words of one visual line joined by a space, a wide gap written as
+    several spaces (so "Auftragsnr.    000000000001" reads like a text page).
+    """
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    from azure.core.credentials import AzureKeyCredential
+
+    client = DocumentIntelligenceClient(endpoint=di["endpoint"], credential=AzureKeyCredential(di["key"]))
+    with open(pdf_path, "rb") as fh:
+        poller = client.begin_analyze_document(
+            "prebuilt-read", io.BytesIO(fh.read()), pages=",".join(str(i + 1) for i in page_idxs))
+    texts = {}
+    for page in poller.result().pages or []:
+        words = []
+        for w in page.words or []:
+            xs, ys = w.polygon[0::2], w.polygon[1::2]
+            words.append({"x0": min(xs), "x1": max(xs), "y": (min(ys) + max(ys)) / 2,
+                          "h": max(ys) - min(ys), "text": w.content})
+        words.sort(key=lambda w: w["y"])
+        lines = []
+        for w in words:   # same visual line = vertical centres within half a word height
+            if lines and abs(w["y"] - lines[-1][0]["y"]) < 0.5 * max(w["h"], lines[-1][0]["h"]):
+                lines[-1].append(w)
+            else:
+                lines.append([w])
+        out = []
+        for line in lines:
+            line.sort(key=lambda w: w["x0"])
+            text = line[0]["text"]
+            for prev, w in zip(line, line[1:]):
+                char_w = (prev["x1"] - prev["x0"]) / max(len(prev["text"]), 1)
+                text += ("    " if w["x0"] - prev["x1"] > 2 * char_w else " ") + w["text"]
+            out.append(text)
+        texts[page.page_number - 1] = "\n".join(out)
+    return texts
+
+
+def _cover_table(texts: list, labelled: dict) -> tuple:
+    """
+    (cover, n_cover): the order table on the leading pages, recognised by its
+    column layout rather than its labels
+    (Auftragsnr. | Anlagennummer | Status | Code Besuchsart), and how many
+    leading pages hold it.
+    """
+    cover, n_cover = {}, 0
+    for i, text in enumerate(texts):
+        rows = [cols for cols in (re.split(r' {2,}', line.strip()) for line in text.splitlines())
+                if len(cols) >= 4 and _ORDER_NO.fullmatch(cols[0]) and cols[1].isdigit()]
+        if not rows or i in labelled:
+            break
+        for cols in rows:
+            cover[cols[0]] = {"asset": cols[1].lstrip("0"), "status": cols[2], "visit_type": cols[3]}
+        n_cover = i + 1
+    return cover, n_cover
+
+
+def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
+    """
+    Split plan for a KONE PDF:
+      {"parts":  [{"order", "asset", "visit_type", "street", "pages"}, ...],
+       "cover":  [page indices of the cover],
+       "problem": None or why the PDF is not cut,
+       "not_in_pdf": cover orders without report pages, e.g. "9B0000000001 (Störung, Geplant)",
+       "ocr_pages": [page indices read by OCR]}
+    "parts" is empty for a single report and whenever there is a problem —
+    better not to cut than to cut wrong. `di` = Azure Document Intelligence
+    credentials {"endpoint", "key"} for pages without a text layer.
+    """
+    reader = PdfReader(pdf_path)
+    texts  = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
+    plan   = {"parts": [], "cover": [], "problem": None, "not_in_pdf": [], "ocr_pages": []}
+
+    no_text = [i for i, t in enumerate(texts) if not t.strip()]
+    unread = []   # pages without text that OCR could not cover
+    if no_text and di:
+        try:
+            for i, text in _ocr_layout_texts(pdf_path, no_text, di).items():
+                texts[i] = text
+            plan["ocr_pages"] = no_text
+        except Exception as exc:
+            print(f"[OCR] {os.path.basename(pdf_path)}: {type(exc).__name__}: {exc}", flush=True)
+            unread = no_text
+    elif no_text:
+        unread = no_text
+
+    def refuse(reason: str) -> dict:
+        plan["parts"], plan["cover"], plan["problem"] = [], [], reason
+        return plan
+
+    labelled = {}   # page index -> order number named by a report label
+    for i, text in enumerate(texts):
+        m = _ORDER_START.search(text)
+        if m:
+            labelled[i] = m.group(1)
+    cover, n_cover = _cover_table(texts, labelled)
+
+    if cover:
+        # Witness 1: the first page after the cover with a line naming the order and its lift
+        starts = []
+        for o, c in cover.items():
+            hit = next((i for i in range(n_cover, len(texts)) if c["asset"] and any(
+                _mentions(line, o) and _mentions(line, c["asset"]) for line in texts[i].splitlines())), None)
+            if hit is not None:
+                starts.append((hit, o))
+        starts.sort()
+    else:
+        # No cover: the labels are the only anchor; a details block repeated on the
+        # next page of the same report is not a new report
+        starts = []
+        for i, o in sorted(labelled.items()):
+            if not starts or starts[-1][1] != o:
+                starts.append((i, o))
+    orders = [o for _, o in starts]
+    first  = starts[0][0] if starts else len(texts)
+    plan["not_in_pdf"] = [f'{o} ({c["visit_type"]}, {c["status"]})' for o, c in cover.items() if o not in orders]
+
+    owner = {}   # page index -> order of the report it belongs to
+    for n, (start, order) in enumerate(starts):
+        for i in range(start, starts[n + 1][0] if n + 1 < len(starts) else len(texts)):
+            owner[i] = order
+
+    if len({i for i, _ in starts}) != len(starts):
+        return refuse("two orders start on the same page")
+    if len(set(orders)) != len(orders):
+        return refuse("an order starts two reports")
+    # Unread pages can hide a report — only a cover listing exactly the one report
+    # found proves a single report
+    if unread and not (len(cover) == 1 and len(starts) == 1):
+        return refuse(f"page(s) {', '.join(str(i + 1) for i in unread)} have no text layer and "
+                      + ("OCR failed" if di else "OCR (Azure Document Intelligence) is not configured"))
+    # Witness 3: a recognised label must name the report its page belongs to
+    for i, o in labelled.items():
+        if owner.get(i) != o:
+            return refuse(f"page {i + 1} is labelled as order {o}, the order numbers disagree")
+    # Every finished order on the cover must have its report in the PDF
+    for o, c in cover.items():
+        if o not in orders and c["status"].lower() not in _OPEN_STATUSES:
+            return refuse(f'order {o} is "{c["status"]}" on the cover, but its report was not found')
+
+    # Witness 2: the merge boundaries in the PDF's fonts must be exactly the report
+    # starts — counted at each report's first page with fonts, since an OCR'd
+    # (image-only) page has none; the PDF's very first font page is no boundary
+    page_tags = [_font_tags(page) for page in reader.pages]
+    bounds = _merge_boundaries(page_tags)
+    if bounds:
+        font_pages = [i for i, tags in enumerate(page_tags) if tags]
+        expected = []
+        for _, order in starts:
+            fp = next((i for i, o in sorted(owner.items()) if o == order and page_tags[i]), None)
+            if fp is not None and fp != font_pages[0]:
+                expected.append(fp)
+        if bounds != sorted(expected):
+            return refuse("the PDF's structure shows reports starting on page(s) "
+                          f"{', '.join(str(i + 1) for i in bounds)}, the order numbers on "
+                          f"{', '.join(str(i + 1) for i in sorted(expected)) or 'none'}")
+    else:
+        # No font witness: fall back to stricter text checks — no page between the
+        # cover and the first report, no order number outside its own report
+        if cover and first > n_cover and len(starts) >= 2:
+            pages = f"page {first}" if first == n_cover + 1 else f"pages {n_cover + 1}–{first}"
+            return refuse(f"{pages} belong(s) to no report")
+        for i in range(first, len(texts)):
+            for o in set(cover) | set(orders):
+                if owner.get(i) != o and _mentions(texts[i], o):
+                    return refuse(f"order {o} appears on page {i + 1}, outside its own report")
+
+    if len(starts) < 2:
+        return plan   # a single report
+
+    plan["cover"] = list(range(first))
+    for start, order in starts:
+        head = texts[start]
+        c = cover.get(order, {})
+        plan["parts"].append({
+            "order":      order,
+            "asset":      c.get("asset") or _layout_field(head, _LABELS["asset"]),
+            "visit_type": c.get("visit_type") or _layout_field(head, _LABELS["visit_type"]),
+            "street":     _layout_field(head, _LABELS["street"]),
+            "pages":      [i for i, o in owner.items() if o == order],
+        })
+    return plan
+
+
+def _content_key(reader, pages: list) -> str:
+    """Fingerprint of what the pages show (text + images), the same for a re-generated copy."""
+    h = hashlib.sha1()
+    for i in pages:
+        page = reader.pages[i]
+        h.update((page.extract_text() or "").encode("utf-8"))
+        try:
+            xobjects = page["/Resources"].get_object().get("/XObject") or {}
+            for ref in xobjects.get_object().values():
+                obj = ref.get_object()
+                if obj.get("/Subtype") == "/Image":
+                    h.update(hashlib.sha1(obj.get_data()).digest())
+        except Exception:
+            pass
+    return h.hexdigest()
+
+
+def split_collective(pdf_path: str, plan: dict, out_dir: str, address: str, seen: dict) -> list:
+    """
+    Write one PDF per report of `plan` plus one for the cover into out_dir and
+    return [(file name, kind, written), ...] with kind "report" or "cover".
+    Reports are named like KONE's single reports plus the order number:
+      "Musterstraße 3_ServiceReport_12345678_Planned Maintenance_000000000001.pdf"
+    using the lift's own street from the report (`address` is the fallback);
+    the cover becomes "<address>_Site Visit Service Report.pdf".
+    `seen` maps content fingerprints to file names across the whole run: a
+    report that another email already delivered is written once
+    (written = False); a different version under the same name gets "_2".
+    All pieces are built before the first file is written, so a PDF that fails
+    leaves nothing half-split behind.
+    """
+    reader = PdfReader(pdf_path)
+    probe  = PdfReader(pdf_path)   # reading text/images caches data on the page objects and
+                                   # would alter the copied pages, so fingerprints use their own reader
+    pieces = [("report", p["pages"], [p["street"] or address, "ServiceReport",
+                                      p["asset"], p["visit_type"], p["order"]])
+              for p in plan["parts"]]
+    if plan["cover"]:
+        pieces.append(("cover", plan["cover"], [address, "Site Visit Service Report"]))
+
+    built = []   # (kind, fingerprint, file stem, pdf bytes or None for a repeat)
+    for kind, pages, bits in pieces:
+        key = _content_key(probe, pages)
+        if key in seen or any(key == b[1] for b in built):
+            built.append((kind, key, None, None))
+            continue
+        writer = PdfWriter()
+        for i in pages:
+            writer.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        writer.write(buf)
+        built.append((kind, key, safe_name("_".join(b for b in bits if b))[:150].rstrip(" ."), buf.getvalue()))
+
+    names = []
+    for kind, key, stem, data in built:
+        if data is None:
+            names.append((seen[key], kind, False))
+            continue
+        path, n = Path(out_dir) / f"{stem}.pdf", 2
+        while path.exists():
+            path, n = Path(out_dir) / f"{stem}_{n}.pdf", n + 1
+        path.write_bytes(data)
+        seen[key] = path.name
+        names.append((path.name, kind, True))
+    return names
+
+
+async def _check_collective(save_path: str, di: dict | None) -> tuple:
+    """
+    (plan, read_error) for a downloaded PDF. The check runs in a worker thread so
+    a slow PDF (or OCR call) cannot stall the browser, and is given up after a
+    timeout. A PDF that cannot be checked is reported, never silently treated as
+    a single report.
+    """
+    try:
+        plan = await asyncio.wait_for(asyncio.to_thread(collective_parts, save_path, di), timeout=180)
+        return plan, None
+    except Exception as exc:
+        reason = "check timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
+        print(f"[collective check] {os.path.basename(save_path)}: {reason}", flush=True)
+        return None, reason
+
+
+async def _download_job(page, address: str, url: str, temp_dir: str, di: dict | None = None):
     """
     Navigate to a KONE Jobdetails page and save all PDFs behind its download icon.
     Returns (list_of_saved_file_info, status_string).
@@ -487,12 +834,19 @@ async def _download_job(page, address: str, url: str, temp_dir: str):
                 stem, ext = suggested.rsplit(".", 1) if "." in suggested else (suggested, "pdf")
                 suggested = f"{stem}_{i+1}.{ext}"
             fname = f"{safe_name(address)}_{suggested}"
+            # Two emails can give the same name (same address once "WG_"/"FW_" is
+            # stripped, same KONE file name): never let one overwrite the other
+            stem, ext = os.path.splitext(fname)
+            n = 2
+            while os.path.exists(os.path.join(temp_dir, fname)):
+                fname, n = f"{stem}_{n}{ext}", n + 1
             save_path = os.path.join(temp_dir, fname)
             result = save(save_path)
             if asyncio.iscoroutine(result):
                 await result
             size_kb = os.path.getsize(save_path) // 1024
-            saved.append({"filename": fname, "size_kb": size_kb})
+            plan, read_error = await _check_collective(save_path, di)
+            saved.append({"filename": fname, "size_kb": size_kb, "plan": plan, "read_error": read_error})
 
         return saved, "ok"
 
@@ -504,7 +858,7 @@ async def _download_job(page, address: str, url: str, temp_dir: str):
         page.remove_listener("download", _on_dl)
 
 
-async def _run_async(jobs, temp_dir: str, state: dict):
+async def _run_async(jobs, temp_dir: str, state: dict, di: dict | None = None):
     """Process all jobs sequentially inside a single Playwright browser session."""
     from playwright.async_api import async_playwright
 
@@ -519,7 +873,7 @@ async def _run_async(jobs, temp_dir: str, state: dict):
             state["current"] = i + 1
             state["status"] = f"[{i+1}/{len(jobs)}] {address}"
 
-            files, status = await _download_job(page, address, url, temp_dir)
+            files, status = await _download_job(page, address, url, temp_dir, di)
             state["results"].append({
                 "msg_file": filename,
                 "address": address,
@@ -536,12 +890,12 @@ async def _run_async(jobs, temp_dir: str, state: dict):
     state["done"] = True
 
 
-def _thread_runner(jobs, temp_dir: str, state: dict):
+def _thread_runner(jobs, temp_dir: str, state: dict, di: dict | None = None):
     """Entry point for the background thread — owns its own event loop."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_run_async(jobs, temp_dir, state))
+        loop.run_until_complete(_run_async(jobs, temp_dir, state, di))
     except Exception as exc:
         state["error"] = str(exc)
         state["done"] = True
@@ -567,6 +921,23 @@ def _results_df(results: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _di_credentials() -> dict | None:
+    """
+    Azure Document Intelligence endpoint + key for OCR of pages without a text
+    layer: Streamlit secrets AZURE_DI_ENDPOINT / AZURE_DI_KEY (same names as the
+    ZÜS PDF Renamer), else environment variables of the same names. None = no OCR.
+    """
+    creds = {}
+    for key, name in (("endpoint", "AZURE_DI_ENDPOINT"), ("key", "AZURE_DI_KEY")):
+        value = ""
+        try:
+            value = st.secrets.get(name, "")   # raises when there is no secrets file at all
+        except Exception:
+            pass
+        creds[key] = value or os.environ.get(name, "")
+    return creds if all(creds.values()) else None
+
+
 def _build_zip(temp_dir: str) -> io.BytesIO | None:
     pdfs = list(Path(temp_dir).glob("*.pdf"))
     if not pdfs:
@@ -580,15 +951,19 @@ def _build_zip(temp_dir: str) -> io.BytesIO | None:
 
 # ── Session state init ────────────────────────────────────────────────────────
 
+_STATE_DEFAULTS = {
+    "processing":   False,
+    "done":         False,
+    "shared_state": None,
+    "temp_dir":     None,
+    "jobs":         None,
+    "split_done":   False,
+    "split_summary": None,
+}
+
+
 def _init_state():
-    defaults = {
-        "processing":   False,
-        "done":         False,
-        "shared_state": None,
-        "temp_dir":     None,
-        "jobs":         None,
-    }
-    for k, v in defaults.items():
+    for k, v in _STATE_DEFAULTS.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -629,7 +1004,7 @@ def main():
         c4.metric("✗ Failed",    fail_count)
 
         st.markdown("### Results")
-        st.dataframe(_results_df(results), use_container_width=True, hide_index=True)
+        st.dataframe(_results_df(results), width="stretch", hide_index=True)
 
         zip_buf = _build_zip(st.session_state.temp_dir)
         if zip_buf:
@@ -639,19 +1014,122 @@ def main():
                 data=zip_buf,
                 file_name="kone_reports.zip",
                 mime="application/zip",
+                on_click="ignore",
             )
         else:
             st.markdown('<div class="warn-box">⚠️ No PDF files were downloaded successfully.</div>',
                         unsafe_allow_html=True)
 
+        # ── Optional post step: split collective reports ──────────────────────
+        files      = [(r, f) for r in results for f in r["files"]]
+        collective = [(r, f) for r, f in files if f.get("plan") and f["plan"]["parts"]]
+        unclear    = [f for _, f in files if f.get("plan") and f["plan"]["problem"]]
+        unchecked  = [f for _, f in files if f.get("read_error")]
+        if collective or unclear or unchecked:
+            st.markdown("---")
+            st.markdown("### ✂️ Collective Reports")
+            if collective:
+                orders = {p["order"] for _, f in collective for p in f["plan"]["parts"]}
+                n_ocr = sum(len(f["plan"]["ocr_pages"]) for _, f in collective)
+                st.markdown(
+                    f'<div class="info-box">{len(collective)} PDF(s) are collective reports '
+                    f'holding <strong>{len(orders)} individual reports</strong>. Splitting gives one '
+                    f'PDF per order (Auftragsnr.) plus each visit\'s cover page, which can hold the '
+                    f'customer signature. The collective PDFs above stay available.'
+                    + (f' {n_ocr} page(s) without a text layer were read by OCR.' if n_ocr else '')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+                rows = [{
+                    "Collective PDF":                 f["filename"],
+                    "Reports":                        len(f["plan"]["parts"]),
+                    "Orders (Auftragsnr.)":           ", ".join(p["order"] for p in f["plan"]["parts"]),
+                    "Listed on cover, no report yet": ", ".join(f["plan"]["not_in_pdf"]) or "—",
+                } for _, f in collective]
+                if not any(f["plan"]["not_in_pdf"] for _, f in collective):
+                    for row in rows:
+                        del row["Listed on cover, no report yet"]
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            if unclear:
+                st.markdown(
+                    f'<div class="warn-box">⚠️ {len(unclear)} PDF(s) could not be split safely and stay '
+                    f'whole — please split them by hand: '
+                    + "; ".join(f'{f["filename"]} ({f["plan"]["problem"]})' for f in unclear)
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+            if unchecked:
+                st.markdown(
+                    f'<div class="warn-box">⚠️ {len(unchecked)} PDF(s) could not be checked for '
+                    f'collective reports and stay whole: '
+                    + "; ".join(f'{f["filename"]} ({f["read_error"]})' for f in unchecked)
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+
+            split_dir = os.path.join(st.session_state.temp_dir, "split")
+            if collective and not st.session_state.split_done:
+                if st.button("✂️ Split Collective Reports"):
+                    os.makedirs(split_dir, exist_ok=True)
+                    # The split ZIP is the full set: collective PDFs cut into their
+                    # reports + cover, every other PDF copied as it is.
+                    summary = {"reports": 0, "covers": 0, "whole": 0, "repeats": 0,
+                               "collective": len(collective), "failed": []}
+                    seen = {}
+                    for r, f in files:
+                        src = os.path.join(st.session_state.temp_dir, f["filename"])
+                        if f.get("plan") and f["plan"]["parts"]:
+                            try:
+                                for _, kind, written in split_collective(
+                                        src, f["plan"], split_dir, r["address"], seen):
+                                    summary[("reports" if kind == "report" else "covers")
+                                            if written else "repeats"] += 1
+                                continue
+                            except Exception as exc:
+                                print(f"[split] {f['filename']}: {type(exc).__name__}: {exc}", flush=True)
+                                summary["failed"].append(f'{f["filename"]} ({type(exc).__name__}: {exc})')
+                        stem, ext = os.path.splitext(f["filename"])
+                        dst, n = Path(split_dir) / f["filename"], 2
+                        while dst.exists():
+                            dst, n = Path(split_dir) / f"{stem}_{n}{ext}", n + 1
+                        shutil.copy2(src, dst)
+                        summary["whole"] += 1
+                    st.session_state.split_summary = summary
+                    st.session_state.split_done = True
+                    st.rerun()
+
+            if st.session_state.split_done:
+                s = st.session_state.split_summary
+                split_count = len(list(Path(split_dir).glob("*.pdf")))
+                st.success(
+                    f"✅ Split done: {s['reports']} report(s) cut from {s['collective'] - len(s['failed'])} "
+                    f"collective PDF(s), {s['covers']} cover page(s) and {s['whole']} PDF(s) copied "
+                    f"unchanged — {split_count} file(s). This ZIP is the complete set, so you only "
+                    f"need this one."
+                    + (f" {s['repeats']} identical copy(ies) from repeated emails were saved once."
+                       if s["repeats"] else "")
+                )
+                if s["failed"]:
+                    st.markdown(
+                        f'<div class="warn-box">⚠️ {len(s["failed"])} PDF(s) could not be split and are in '
+                        f'the ZIP whole: ' + "; ".join(s["failed"]) + '</div>',
+                        unsafe_allow_html=True,
+                    )
+                st.download_button(
+                    label=f"⬇️  Download individual reports — {split_count} file(s) in ZIP",
+                    data=_build_zip(split_dir),
+                    file_name="kone_reports_split.zip",
+                    mime="application/zip",
+                    key="download_split",
+                    on_click="ignore",
+                )
+
         st.markdown("---")
         if st.button("🔄 Start New Batch"):
             if st.session_state.temp_dir and os.path.exists(st.session_state.temp_dir):
                 shutil.rmtree(st.session_state.temp_dir, ignore_errors=True)
-            for k in ("processing", "done", "shared_state", "temp_dir", "jobs"):
-                st.session_state[k] = {"processing": False, "done": False,
-                                        "shared_state": None, "temp_dir": None,
-                                        "jobs": None}[k]
+            for k, v in _STATE_DEFAULTS.items():
+                st.session_state[k] = v
             st.rerun()
         return
 
@@ -680,7 +1158,7 @@ def main():
             if shared["results"]:
                 with results_container.container():
                     st.dataframe(_results_df(shared["results"]),
-                                 use_container_width=True, hide_index=True)
+                                 width="stretch", hide_index=True)
             time.sleep(0.5)
 
         progress_bar.progress(1.0)
@@ -689,7 +1167,7 @@ def main():
         if shared["results"]:
             with results_container.container():
                 st.dataframe(_results_df(shared["results"]),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
 
         if shared.get("error"):
             st.error(f"An unexpected error occurred: {shared['error']}")
@@ -735,7 +1213,7 @@ def main():
             "URL Found": "✓ Yes" if url else "✗ No",
         })
 
-    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
 
     valid_jobs    = [(a, u, f) for a, u, f in jobs if u is not None]
     invalid_count = len(jobs) - len(valid_jobs)
@@ -775,7 +1253,7 @@ def main():
 
         threading.Thread(
             target=_thread_runner,
-            args=(valid_jobs, temp_dir, shared_state),
+            args=(valid_jobs, temp_dir, shared_state, _di_credentials()),
             daemon=True,
         ).start()
         st.rerun()

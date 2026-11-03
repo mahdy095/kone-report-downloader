@@ -4,7 +4,7 @@
 
 A publicly deployed Streamlit web app that automates downloading PDF service reports from the KONE customer portal. Users upload `.msg` email files (Outlook), the app extracts the portal URL from each email, launches a headless Chromium browser (Playwright) server-side, navigates to each URL, clicks the download button, and bundles all collected PDFs into a single ZIP file for download. No installation required on the user's device — everything runs on Streamlit Cloud.
 
-**Live URL:** (set after deployment on Streamlit Cloud)
+**Live URL:** see `README.md`
 **GitHub:** https://github.com/mahdy095/kone-report-downloader
 
 ---
@@ -12,11 +12,12 @@ A publicly deployed Streamlit web app that automates downloading PDF service rep
 ## Repository structure
 
 ```
-kone_downloader/
-├── app.py                    # Single-file Streamlit app (~580 lines)
+KONE_Report_Downloader/
+├── app.py                    # Single-file Streamlit app (~1,000 lines)
 ├── requirements.txt          # Python dependencies
-├── packages.txt              # System-level apt packages for Chromium on Debian Trixie
-├── runtime.txt               # Pins Python 3.11
+├── packages.txt.disabled     # Old apt list, disabled (see "packages.txt is DISABLED" below)
+├── runtime.txt               # Python 3.11
+├── README.md                 # Short overview + how to run locally
 ├── .streamlit/
 │   └── config.toml           # maxUploadSize, theme colours
 └── .gitignore
@@ -92,11 +93,13 @@ libxrandr2
 ### requirements.txt
 
 ```
-streamlit>=1.29.0
+streamlit>=1.50.0                     # width="stretch", download_button(on_click="ignore")
 playwright>=1.40.0
 extract-msg>=0.28.0
 pandas>=2.0.0
 openpyxl>=3.1.0
+pypdf==6.16.2                         # collective-report split; pinned: detection reads its layout-mode text spacing
+azure-ai-documentintelligence==1.0.2  # OCR of pages without a text layer (same version as the ZÜS PDF Renamer)
 ```
 
 ### .streamlit/config.toml
@@ -129,7 +132,7 @@ def _install_chromium():
     return result.returncode == 0, (result.stdout + result.stderr).strip()
 ```
 
-`@st.cache_resource` ensures this runs only once per deployment (not on every page load). The `packages.txt` provides the system-level libs; this call downloads the browser binary only.
+`@st.cache_resource` ensures this runs only once per deployment (not on every page load). This call downloads the browser binary only; the system-level libs are installed at runtime (see "packages.txt is DISABLED").
 
 **Launch flags required on Linux:**
 ```python
@@ -184,6 +187,9 @@ The app has three mutually exclusive UI states, controlled by `st.session_state`
 - Summary metrics (Processed / PDFs saved / Skipped / Failed)
 - Full results dataframe
 - `st.download_button` for the ZIP file
+- **✂️ Collective Reports** section — only when a downloaded PDF is a collective report (see below):
+  table of collective PDFs, `✂️ Split Collective Reports` button, then a second download button
+  `kone_reports_split.zip`. Both ZIPs stay available.
 - `🔄 Start New Batch` button clears session state and reruns
 
 ### Session state keys
@@ -193,7 +199,10 @@ The app has three mutually exclusive UI states, controlled by `st.session_state`
 "shared_state" # dict — live progress shared with background thread
 "temp_dir"     # str  — tempfile.mkdtemp() path for downloaded PDFs
 "jobs"         # list — [(address, url, filename), ...]
+"split_done"   # bool — collective reports were split into temp_dir/split
+"split_summary" # dict — counts of the split (reports, covers, whole, repeats, failed) for the result message
 ```
+All defaults live in `_STATE_DEFAULTS`; "Start New Batch" resets every key from it.
 
 ### shared_state dict structure
 ```python
@@ -213,7 +222,8 @@ Each result dict:
     "msg_file": str,   # original .msg filename
     "address":  str,   # building address (derived from filename)
     "status":   str,   # "ok" | "expired" | "no_button" | "no_download" | "timeout" | "error"
-    "files":    list,  # [{"filename": str, "size_kb": int}, ...]
+    "files":    list,  # [{"filename": str, "size_kb": int,
+                       #   "plan": dict|None, "read_error": str|None}, ...]  ← see Collective reports
     "count":    int,   # number of PDFs downloaded for this job
 }
 ```
@@ -247,7 +257,7 @@ def extract_url(msg_bytes: bytes) -> str | None:
 Address extraction from filename:
 ```python
 address = uf.name.replace("Ihr Service-Update _ ", "").replace(".msg", "").strip()
-# e.g. "Ihr Service-Update _ Eifelplatz 17.msg" → "Eifelplatz 17"
+# e.g. "Ihr Service-Update _ Musterstraße 1.msg" → "Musterstraße 1"
 # Also handles "WG_ Ihr Service-Update _ ..." (forwarded) via strip()
 ```
 
@@ -296,8 +306,97 @@ async with async_playwright() as p:
 **Output filename format:**
 ```
 {safe_name(address)}_{original_suggested_filename}.pdf
-# e.g. "Eifelplatz 17_ServiceReport_40266931_Planned Maintenance.pdf"
+# e.g. "Musterstraße 1_ServiceReport_12345678_Planned Maintenance.pdf"
 ```
+Two emails can give the same name (same address after the `WG_`/`FW_` prefix is stripped, same KONE file name):
+the later one gets `_2`, `_3` … so no download overwrites another (since 03.11 — before, the second silently
+replaced the first in the ZIP).
+
+---
+
+## Collective reports (split step, added 2026-11-03)
+
+Since Oct 2026 KONE often sends **one PDF per site visit** instead of one per order:
+
+| Pages | Content |
+|---|---|
+| 1 (cover, always German) | "Site Visit Service Report": visit header + table **List of performed works** (`Auftragsnr. \| Anlagennummer \| Status \| Code Besuchsart`) + visit signature |
+| then, per order | "Service Report": header + details block with the order number; runs until the next report starts, ends with its own signature block (a trailing blank page may belong to it) |
+
+The report pages come in **two label languages**, also mixed within one batch (seen 03.11):
+
+| Field | German pages | English pages |
+|---|---|---|
+| order (start of a report) | `Auftragsnr.  000000000001` (block "Arbeitsdetails" / "Auftragsdetails") | `Service Order  000000000002` + `Number` on the next line (block "Work details") |
+| street | `Straße` | `Street` |
+| lift number | `Vermögenswert` | `Equipment` (first one; the second "Equipment Record Type" = Elevator) |
+| reason (fallback for the visit type) | `Auftragsgrund` | `Customer Facing Description` |
+
+The **cover can list orders that have no report pages** in the PDF: status seen `Geplant` (planned Störung),
+`Angekommen` (Inspektion in progress). Status `Unterschrift` did have a report. So the status says nothing reliable
+about presence. Report types seen: Planned Maintenance (1–3 pages), Repair (1–2), Störung (2), Inspektion. Order
+numbers are 12 characters, digits or `9B…`. A cover with only one report = a single report (not split). The same
+email can arrive twice → byte-identical PDFs.
+
+**Detection + plan** — `collective_parts(pdf_path, di)` → plan dict `{parts, cover, problem, not_in_pdf, ocr_pages}`,
+run right after each PDF is saved, in a worker thread with a 180 s timeout (`_check_collective`, so a slow PDF or OCR
+call cannot stall the browser). Stored on the file record as `plan`; a PDF that cannot be read at all gets
+`read_error` (logged + own warning in the UI — never silently "single").
+
+The split is **anchored on order numbers and PDF structure, not on label wording**. Three independent witnesses:
+1. **Order numbers.** Cover = the leading pages holding the order table, recognised by its **column layout** (pypdf
+   layout text, a line splitting on 2+ spaces into ≥ 4 columns: order no. + all-digit Anlagennummer + status +
+   Besuchsart). A report starts on the first page after the cover where **one line holds the order number and its lift
+   number** (the details-block row `Auftragsnr. … Vermögenswert …` / `Service Order … Equipment …` in every
+   language; 41 of 41 real starts). No "first mention" fallback: a mere mention of an order elsewhere is never a start.
+2. **Fonts (merge structure).** KONE merges one PDF per report; each brings its own font subset tags
+   (`ABCDEF+ArialMT`). A page sharing **no** tag with the previous font-carrying page = first page of a merged PDF
+   (`_merge_boundaries`). Matched the cut points in 22 of 22 real PDFs. When present, these boundaries must equal each
+   report's first page with fonts (OCR'd image pages carry none), otherwise refused.
+3. **Labels** (`_ORDER_START`: `Auftragsnr.` / `Service Order`): a page a label recognises must belong to that order's
+   report. Without a cover the labels are the anchor (a details block repeated on the next page of the same order is
+   not a new report), checked against witness 2.
+
+Refused (PDF stays whole, reason shown): witnesses disagree; two orders on one start page; one order starting twice;
+an order whose status on the cover is not `Geplant`/`Angekommen` (`_OPEN_STATUSES`) but has no report in the PDF;
+pages without a text layer that OCR could not read (unless a cover lists exactly the one report found). **Only when
+the font witness is missing** (no boundaries in the PDF) the stricter text checks apply: no page between cover and
+first report, and no order number outside its own report.
+
+**OCR for pages without a text layer** — Azure Document Intelligence `prebuilt-read` (`_ocr_layout_texts`), same
+resource and secret names as the ZÜS PDF Renamer: **`AZURE_DI_ENDPOINT` / `AZURE_DI_KEY`** in Streamlit secrets (or
+environment variables). Words are regrouped into visual lines and wide gaps written as several spaces, so OCR text
+goes through exactly the same parsing as a text page. Without credentials such a PDF is refused with a clear reason.
+
+Cover orders without report pages → `not_in_pdf` ("9B0000000001 (Störung, Geplant)") → UI column
+"Listed on cover, no report yet".
+
+Tests (scratch scripts, 03.11): 22 real PDFs → 28 report files **byte-identical** to the end-to-end-verified version;
+all labels switched off → same cuts for all 22; 32-case suite on real PDFs with real fonts (phantom mentions of open
+orders, mentions of other orders, conflicting labels, image-only start / continuation / cover / every page with and
+without OCR, no cover, unrecognised label without cover, merged singles, cover moved to the end, missing finished
+report, re-generated copy with new font tags) and 16 synthetic cases without fonts — all pass.
+
+**Split** — `split_collective(pdf, plan, out_dir, address, seen)`, only when the user clicks the button. Output in
+`temp_dir/split/` = the full set: every collective PDF cut into its reports **plus its cover as its own file**
+(`<address>_Site Visit Service Report.pdf` — the cover can hold the only customer signature, seen 1 of 11), every
+other PDF copied unchanged. Each PDF is split all-or-nothing (pieces built in memory first); a PDF whose split fails
+is copied whole and listed in a warning — the rest still splits. Report file name = KONE's single-report pattern +
+order number, with the lift's **own street from the report** (the email subject only names one address of the visit):
+```
+{Straße}_ServiceReport_{Anlagennummer}_{Code Besuchsart}_{Auftragsnr}.pdf
+# e.g. "Musterstraße 3_ServiceReport_12345678_Planned Maintenance_000000000001.pdf"
+```
+Fallbacks without a cover row: lift number / reason text from the report page (then the name shows e.g.
+"Regelmäßige Wartung" instead of KONE's code); street → email address. **Duplicates** are recognised by content
+(`_content_key`: page text + image data, computed on a separate reader so the copied pages stay byte-identical), so a
+report delivered by two emails — even re-generated with new font tags — is written once; a different version of the
+same order gets `_2` (order of upload, not "newer").
+
+Verified: 3 German samples + 19 real emails of 02–03.11.2026 end-to-end against the live portal (the samples hold
+customer data and are kept outside the repo). **Dutch collective reports: not seen yet** — the number and font
+witnesses do not depend on language, so they should split as long as the cover table keeps its column layout; only
+the street in the file name falls back to the email address until the Dutch street label is added to `_LABELS`.
 
 ---
 
