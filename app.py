@@ -1100,8 +1100,9 @@ def main():
                     f'<div class="info-box">{len(collective)} PDF(s) enthalten jeweils mehrere Berichte, '
                     f'zusammen <strong>{_n(len(orders), "Einzelbericht", "Einzelberichte")}</strong>. '
                     f'Mit „Sammelberichte aufteilen“ bekommst du jeden Bericht als eigene PDF, dazu das '
-                    f'Deckblatt jedes Termins (darauf steht oft die Kundenunterschrift). Die ursprünglichen '
-                    f'PDFs kannst du oben weiterhin herunterladen.</div>',
+                    f'Deckblatt jedes Termins (darauf steht oft die Kundenunterschrift). Das ZIP enthält '
+                    f'außerdem alle anderen Berichte unverändert – danach brauchst du nur dieses eine ZIP. '
+                    f'Die ursprünglichen PDFs kannst du oben weiterhin herunterladen.</div>',
                     unsafe_allow_html=True,
                 )
                 rows = [{
