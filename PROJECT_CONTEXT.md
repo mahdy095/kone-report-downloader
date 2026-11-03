@@ -168,14 +168,27 @@ The background thread writes progress into a shared `state` dict stored in `st.s
 
 ## App flow / UI states
 
-The app has three mutually exclusive UI states, controlled by `st.session_state`:
+The app has three mutually exclusive UI states, controlled by `st.session_state`.
+
+**UI language: German** (since 03.11), written for non-technical back-office users ("du"). No technical text on
+screen: why a PDF was not split is shown as one of three plain sentences (`_PROBLEM_TEXT`, keyed by the plan's
+`problem_kind`: `unclear` / `missing` / `scanned`; unreadable files get their own sentence); the technical reason
+is `print`ed to the server log (`[collective check] …`, `[OCR] …`, `[split] …`, `[download run] …` — Streamlit
+Cloud → Manage app → logs). Streamlit's own English uploader texts ("Upload", "200MB per file • MSG") are replaced
+via CSS (`font-size: 0` + `::after` content). Left in English by Streamlit itself: the table toolbar tooltips and
+the Cloud menu (Share / ⋮ / Manage app).
+
+**"🐞 Problem melden"** — a fixed link bottom right (`.report-issue`, `bottom: 64px` so it clears Cloud's
+"Manage app" button) on every screen: `mailto:a.elmahdi@hundt-consult.de` (`_REPORT_MAILTO`), subject "Problem
+mit dem KONE-Bericht-Downloader", body "Beschreibung des Problems:" + 3 lines + "Füge bitte nach Möglichkeit
+Screenshots hinzu." It opens the user's default mail app (Outlook on the office PCs).
 
 ### State 1: UPLOAD (default)
 - `st.file_uploader` with `accept_multiple_files=True`, `label_visibility="collapsed"`, `type=["msg"]`
 - Max 50 files enforced with a warning
-- On upload: extract URL from each .msg, show preview table (`MSG File`, `URL Found`)
-- Show 3 metrics: Files Uploaded / URLs Extracted / No URL (skipped)
-- `🚀 Start Download` button → transitions to PROCESSING state
+- On upload: extract URL from each .msg, show preview table (`E-Mail`, `Bericht-Link gefunden`)
+- Show 3 metrics: Hochgeladen / Links gefunden / Ohne Link (übersprungen)
+- `🚀 Download starten` button → transitions to PROCESSING state
 
 ### State 2: PROCESSING
 - Blocking `while not shared["done"]: time.sleep(0.5)` loop in main thread
@@ -184,13 +197,13 @@ The app has three mutually exclusive UI states, controlled by `st.session_state`
 - On completion → `st.session_state.done = True` → `st.rerun()` → transitions to DONE state
 
 ### State 3: DONE
-- Summary metrics (Processed / PDFs saved / Skipped / Failed)
+- Summary metrics (Verarbeitet / PDFs gespeichert / Übersprungen / Fehlgeschlagen)
 - Full results dataframe
-- `st.download_button` for the ZIP file
-- **✂️ Collective Reports** section — only when a downloaded PDF is a collective report (see below):
-  table of collective PDFs, `✂️ Split Collective Reports` button, then a second download button
-  `kone_reports_split.zip`. Both ZIPs stay available.
-- `🔄 Start New Batch` button clears session state and reruns
+- `st.download_button` for the ZIP file `kone_berichte.zip`
+- **✂️ Sammelberichte** section — only when a downloaded PDF is a collective report (see below):
+  table of collective PDFs, `✂️ Sammelberichte aufteilen` button, then a second download button
+  `kone_einzelberichte.zip`. Both ZIPs stay available.
+- `🔄 Neue E-Mails verarbeiten` button clears session state and reruns
 
 ### Session state keys
 ```python
@@ -379,7 +392,7 @@ report, re-generated copy with new font tags) and 16 synthetic cases without fon
 
 **Split** — `split_collective(pdf, plan, out_dir, address, seen)`, only when the user clicks the button. Output in
 `temp_dir/split/` = the full set: every collective PDF cut into its reports **plus its cover as its own file**
-(`<address>_Site Visit Service Report.pdf` — the cover can hold the only customer signature, seen 1 of 11), every
+(`<address>_Deckblatt.pdf` — the cover can hold the only customer signature, seen 1 of 11), every
 other PDF copied unchanged. Each PDF is split all-or-nothing (pieces built in memory first); a PDF whose split fails
 is copied whole and listed in a warning — the rest still splits. Report file name = KONE's single-report pattern +
 order number, with the lift's **own street from the report** (the email subject only names one address of the visit):

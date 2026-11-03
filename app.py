@@ -17,7 +17,9 @@ import time
 import sys
 import subprocess
 import shutil
+from html import escape
 from pathlib import Path
+from urllib.parse import quote
 
 import streamlit as st
 import pandas as pd
@@ -166,7 +168,7 @@ def _install_chromium():
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="KONE Report Downloader",
+    page_title="KONE-Serviceberichte",
     page_icon="📥",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -290,6 +292,36 @@ st.markdown("""
     border-radius: 14px !important;
     background: rgba(238, 242, 255, 0.5) !important;
 }
+/* Streamlit writes the uploader's own texts in English; show German ones instead */
+[data-testid="stFileUploaderDropzone"] button [data-testid="stMarkdownContainer"] p { font-size: 0 !important; }
+[data-testid="stFileUploaderDropzone"] button [data-testid="stMarkdownContainer"] p::after {
+    content: "Dateien auswählen"; font-size: 1rem;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] span { font-size: 0 !important; }
+[data-testid="stFileUploaderDropzoneInstructions"] span::after {
+    content: "oder E-Mails (.msg) hierher ziehen – max. 200 MB pro Datei"; font-size: 0.92rem;
+}
+
+/* "Problem melden" – bottom right on every screen, above Streamlit Cloud's "Manage app" */
+.report-issue {
+    position: fixed;
+    right: 24px;
+    bottom: 64px;
+    z-index: 1000;
+    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    color: white !important;
+    padding: 10px 18px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.92rem;
+    text-decoration: none !important;
+    box-shadow: 0 4px 15px rgba(99, 102, 241, 0.35);
+    transition: all 0.2s ease;
+}
+.report-issue:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px rgba(99, 102, 241, 0.5);
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -297,13 +329,21 @@ st.markdown("""
 MAX_FILES = 50
 
 STATUS_META = {
-    "ok":          ("✓ Downloaded",  "badge-ok"),
-    "expired":     ("⊘ Link Expired","badge-skip"),
-    "no_button":   ("⊘ No Button",  "badge-skip"),
-    "no_download": ("⊘ No File",    "badge-skip"),
-    "timeout":     ("✗ Timeout",    "badge-fail"),
-    "error":       ("✗ Error",      "badge-fail"),
+    "ok":          ("✓ Heruntergeladen",            "badge-ok"),
+    "expired":     ("⊘ Link abgelaufen",            "badge-skip"),
+    "no_button":   ("⊘ Kein Bericht auf der Seite", "badge-skip"),
+    "no_download": ("⊘ Keine Datei erhalten",       "badge-skip"),
+    "timeout":     ("✗ Zeitüberschreitung",         "badge-fail"),
+    "error":       ("✗ Fehler",                     "badge-fail"),
 }
+
+# "Problem melden" opens a new email (the user's default mail app, e.g. Outlook)
+_REPORT_MAILTO = "mailto:a.elmahdi@hundt-consult.de?subject={}&body={}".format(
+    quote("Problem mit dem KONE-Bericht-Downloader"),
+    quote("Beschreibung des Problems:\r\n\r\n"
+          + "_______________________________________________\r\n\r\n" * 3
+          + "Füge bitte nach Möglichkeit Screenshots hinzu.\r\n"),
+)
 
 # ── Core helpers ──────────────────────────────────────────────────────────────
 
@@ -557,7 +597,8 @@ def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
     Split plan for a KONE PDF:
       {"parts":  [{"order", "asset", "visit_type", "street", "pages"}, ...],
        "cover":  [page indices of the cover],
-       "problem": None or why the PDF is not cut,
+       "problem": None or why the PDF is not cut (technical, for the log),
+       "problem_kind": "unclear" | "missing" | "scanned", "problem_order": order no. for "missing",
        "not_in_pdf": cover orders without report pages, e.g. "9B0000000001 (Störung, Geplant)",
        "ocr_pages": [page indices read by OCR]}
     "parts" is empty for a single report and whenever there is a problem —
@@ -566,7 +607,8 @@ def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
     """
     reader = PdfReader(pdf_path)
     texts  = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
-    plan   = {"parts": [], "cover": [], "problem": None, "not_in_pdf": [], "ocr_pages": []}
+    plan   = {"parts": [], "cover": [], "problem": None, "problem_kind": None, "problem_order": "",
+              "not_in_pdf": [], "ocr_pages": []}
 
     no_text = [i for i, t in enumerate(texts) if not t.strip()]
     unread = []   # pages without text that OCR could not cover
@@ -581,8 +623,11 @@ def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
     elif no_text:
         unread = no_text
 
-    def refuse(reason: str) -> dict:
-        plan["parts"], plan["cover"], plan["problem"] = [], [], reason
+    def refuse(reason: str, kind: str = "unclear", order: str = "") -> dict:
+        """`reason` is technical and goes to the log; `kind` ("unclear" | "missing" |
+        "scanned") and `order` let the UI say it in plain words."""
+        print(f"[collective check] {os.path.basename(str(pdf_path))} not split: {reason}", flush=True)
+        plan.update(parts=[], cover=[], problem=reason, problem_kind=kind, problem_order=order)
         return plan
 
     labelled = {}   # page index -> order number named by a report label
@@ -625,7 +670,8 @@ def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
     # found proves a single report
     if unread and not (len(cover) == 1 and len(starts) == 1):
         return refuse(f"page(s) {', '.join(str(i + 1) for i in unread)} have no text layer and "
-                      + ("OCR failed" if di else "OCR (Azure Document Intelligence) is not configured"))
+                      + ("OCR failed" if di else "OCR (Azure Document Intelligence) is not configured"),
+                      kind="scanned")
     # Witness 3: a recognised label must name the report its page belongs to
     for i, o in labelled.items():
         if owner.get(i) != o:
@@ -633,7 +679,8 @@ def collective_parts(pdf_path: str, di: dict | None = None) -> dict:
     # Every finished order on the cover must have its report in the PDF
     for o, c in cover.items():
         if o not in orders and c["status"].lower() not in _OPEN_STATUSES:
-            return refuse(f'order {o} is "{c["status"]}" on the cover, but its report was not found')
+            return refuse(f'order {o} is "{c["status"]}" on the cover, but its report was not found',
+                          kind="missing", order=o)
 
     # Witness 2: the merge boundaries in the PDF's fonts must be exactly the report
     # starts — counted at each report's first page with fonts, since an OCR'd
@@ -703,7 +750,7 @@ def split_collective(pdf_path: str, plan: dict, out_dir: str, address: str, seen
     Reports are named like KONE's single reports plus the order number:
       "Musterstraße 3_ServiceReport_12345678_Planned Maintenance_000000000001.pdf"
     using the lift's own street from the report (`address` is the fallback);
-    the cover becomes "<address>_Site Visit Service Report.pdf".
+    the cover becomes "<address>_Deckblatt.pdf".
     `seen` maps content fingerprints to file names across the whole run: a
     report that another email already delivered is written once
     (written = False); a different version under the same name gets "_2".
@@ -717,7 +764,7 @@ def split_collective(pdf_path: str, plan: dict, out_dir: str, address: str, seen
                                       p["asset"], p["visit_type"], p["order"]])
               for p in plan["parts"]]
     if plan["cover"]:
-        pieces.append(("cover", plan["cover"], [address, "Site Visit Service Report"]))
+        pieces.append(("cover", plan["cover"], [address, "Deckblatt"]))
 
     built = []   # (kind, fingerprint, file stem, pdf bytes or None for a repeat)
     for kind, pages, bits in pieces:
@@ -897,6 +944,7 @@ def _thread_runner(jobs, temp_dir: str, state: dict, di: dict | None = None):
     try:
         loop.run_until_complete(_run_async(jobs, temp_dir, state, di))
     except Exception as exc:
+        print(f"[download run] {type(exc).__name__}: {exc}", flush=True)
         state["error"] = str(exc)
         state["done"] = True
     finally:
@@ -907,16 +955,16 @@ def _thread_runner(jobs, temp_dir: str, state: dict, di: dict | None = None):
 def _results_df(results: list) -> pd.DataFrame:
     rows = []
     for r in results:
-        label, _ = STATUS_META.get(r["status"], ("? Unknown", "badge-skip"))
+        label, _ = STATUS_META.get(r["status"], ("? Unbekannt", "badge-skip"))
         files_str = (
             ", ".join(f"{f['filename']} ({f['size_kb']} KB)" for f in r["files"])
             if r["files"] else "—"
         )
         rows.append({
-            "MSG File": r["msg_file"],
-            "Status":   label,
-            "PDFs":     r["count"],
-            "Files":    files_str,
+            "E-Mail":  r["msg_file"],
+            "Status":  label,
+            "PDFs":    r["count"],
+            "Dateien": files_str,
         })
     return pd.DataFrame(rows)
 
@@ -969,20 +1017,39 @@ def _init_state():
 
 # ── Main app ──────────────────────────────────────────────────────────────────
 
+# What the user reads when a PDF stays whole; the technical reason is in the log.
+_PROBLEM_TEXT = {
+    "unclear": "Die Aufteilung ist nicht eindeutig erkennbar.",
+    "missing": "Laut Deckblatt ist Auftrag {order} abgeschlossen, sein Bericht fehlt aber in der PDF.",
+    "scanned": "Einige Seiten sind eingescannt und konnten nicht gelesen werden.",
+}
+
+
+def _n(count: int, one: str, many: str) -> str:
+    return f"{count} {one if count == 1 else many}"
+
+
+def _file_list(items) -> str:
+    """HTML lines "• <file>: <text>" for a warning box."""
+    return "<br>".join(f"• <strong>{escape(name)}</strong>: {escape(text)}" for name, text in items)
+
+
 def main():
     chromium_ok, chromium_log = _install_chromium()
     _init_state()
 
-    # ── Hero ──────────────────────────────────────────────────────────────────
-    st.markdown("""
+    # ── Hero + "Problem melden" (bottom right, on every screen) ────────────────
+    st.markdown(f"""
 <div class="hero-section">
-    <h1>📥 KONE Service Report Downloader</h1>
+    <h1>📥 KONE-Serviceberichte herunterladen</h1>
 </div>
+<a class="report-issue" href="{escape(_REPORT_MAILTO)}" target="_blank" rel="noopener">🐞 Problem melden</a>
 """, unsafe_allow_html=True)
 
     if not chromium_ok:
-        st.error("⚠️ Chromium browser could not be initialised. The app cannot process files.")
-        with st.expander("Technical details"):
+        st.error("⚠️ Die App kann gerade keine Berichte herunterladen, weil ihr Browser nicht gestartet "
+                 "werden konnte. Bitte versuche es später noch einmal oder melde das Problem.")
+        with st.expander("Technische Details (für den Support)"):
             st.code(chromium_log)
         return
 
@@ -991,33 +1058,32 @@ def main():
         shared   = st.session_state.shared_state
         results  = shared["results"]
         pdf_count  = sum(r["count"] for r in results)
-        ok_count   = sum(1 for r in results if r["status"] == "ok")
         skip_count = sum(1 for r in results if r["status"] in ("expired", "no_button", "no_download"))
         fail_count = sum(1 for r in results if r["status"] in ("timeout", "error"))
 
-        st.success("✅ Processing complete!")
+        st.success("✅ Fertig!")
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Processed",    len(results))
-        c2.metric("✓ PDFs saved", pdf_count)
-        c3.metric("⊘ Skipped",   skip_count)
-        c4.metric("✗ Failed",    fail_count)
+        c1.metric("Verarbeitet",        len(results))
+        c2.metric("✓ PDFs gespeichert", pdf_count)
+        c3.metric("⊘ Übersprungen",     skip_count)
+        c4.metric("✗ Fehlgeschlagen",   fail_count)
 
-        st.markdown("### Results")
+        st.markdown("### Ergebnisse")
         st.dataframe(_results_df(results), width="stretch", hide_index=True)
 
         zip_buf = _build_zip(st.session_state.temp_dir)
         if zip_buf:
             st.markdown("---")
             st.download_button(
-                label=f"⬇️  Download all PDFs — {pdf_count} file(s) in ZIP",
+                label=f"⬇️  Alle PDFs herunterladen – {_n(pdf_count, 'Datei', 'Dateien')} als ZIP",
                 data=zip_buf,
-                file_name="kone_reports.zip",
+                file_name="kone_berichte.zip",
                 mime="application/zip",
                 on_click="ignore",
             )
         else:
-            st.markdown('<div class="warn-box">⚠️ No PDF files were downloaded successfully.</div>',
+            st.markdown('<div class="warn-box">⚠️ Es konnte keine PDF heruntergeladen werden.</div>',
                         unsafe_allow_html=True)
 
         # ── Optional post step: split collective reports ──────────────────────
@@ -1027,49 +1093,48 @@ def main():
         unchecked  = [f for _, f in files if f.get("read_error")]
         if collective or unclear or unchecked:
             st.markdown("---")
-            st.markdown("### ✂️ Collective Reports")
+            st.markdown("### ✂️ Sammelberichte")
             if collective:
                 orders = {p["order"] for _, f in collective for p in f["plan"]["parts"]}
-                n_ocr = sum(len(f["plan"]["ocr_pages"]) for _, f in collective)
                 st.markdown(
-                    f'<div class="info-box">{len(collective)} PDF(s) are collective reports '
-                    f'holding <strong>{len(orders)} individual reports</strong>. Splitting gives one '
-                    f'PDF per order (Auftragsnr.) plus each visit\'s cover page, which can hold the '
-                    f'customer signature. The collective PDFs above stay available.'
-                    + (f' {n_ocr} page(s) without a text layer were read by OCR.' if n_ocr else '')
-                    + '</div>',
+                    f'<div class="info-box">{len(collective)} PDF(s) enthalten jeweils mehrere Berichte, '
+                    f'zusammen <strong>{_n(len(orders), "Einzelbericht", "Einzelberichte")}</strong>. '
+                    f'Mit „Sammelberichte aufteilen“ bekommst du jeden Bericht als eigene PDF, dazu das '
+                    f'Deckblatt jedes Termins (darauf steht oft die Kundenunterschrift). Die ursprünglichen '
+                    f'PDFs kannst du oben weiterhin herunterladen.</div>',
                     unsafe_allow_html=True,
                 )
                 rows = [{
-                    "Collective PDF":                 f["filename"],
-                    "Reports":                        len(f["plan"]["parts"]),
-                    "Orders (Auftragsnr.)":           ", ".join(p["order"] for p in f["plan"]["parts"]),
-                    "Listed on cover, no report yet": ", ".join(f["plan"]["not_in_pdf"]) or "—",
+                    "Sammel-PDF":                f["filename"],
+                    "Berichte":                  len(f["plan"]["parts"]),
+                    "Auftragsnummern":           ", ".join(p["order"] for p in f["plan"]["parts"]),
+                    "Laut Deckblatt noch offen": ", ".join(f["plan"]["not_in_pdf"]) or "—",
                 } for _, f in collective]
                 if not any(f["plan"]["not_in_pdf"] for _, f in collective):
                     for row in rows:
-                        del row["Listed on cover, no report yet"]
+                        del row["Laut Deckblatt noch offen"]
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             if unclear:
                 st.markdown(
-                    f'<div class="warn-box">⚠️ {len(unclear)} PDF(s) could not be split safely and stay '
-                    f'whole — please split them by hand: '
-                    + "; ".join(f'{f["filename"]} ({f["plan"]["problem"]})' for f in unclear)
+                    f'<div class="warn-box">⚠️ {len(unclear)} PDF(s) konnten nicht automatisch aufgeteilt '
+                    f'werden und bleiben vollständig erhalten. Bitte teile sie von Hand auf:<br>'
+                    + _file_list((f["filename"], _PROBLEM_TEXT[f["plan"]["problem_kind"]].format(
+                        order=f["plan"]["problem_order"])) for f in unclear)
                     + '</div>',
                     unsafe_allow_html=True,
                 )
             if unchecked:
                 st.markdown(
-                    f'<div class="warn-box">⚠️ {len(unchecked)} PDF(s) could not be checked for '
-                    f'collective reports and stay whole: '
-                    + "; ".join(f'{f["filename"]} ({f["read_error"]})' for f in unchecked)
+                    f'<div class="warn-box">⚠️ {len(unchecked)} PDF(s) konnten nicht geprüft werden und '
+                    f'bleiben vollständig erhalten:<br>'
+                    + _file_list((f["filename"], "Die Datei konnte nicht gelesen werden.") for f in unchecked)
                     + '</div>',
                     unsafe_allow_html=True,
                 )
 
             split_dir = os.path.join(st.session_state.temp_dir, "split")
             if collective and not st.session_state.split_done:
-                if st.button("✂️ Split Collective Reports"):
+                if st.button("✂️ Sammelberichte aufteilen"):
                     os.makedirs(split_dir, exist_ok=True)
                     # The split ZIP is the full set: collective PDFs cut into their
                     # reports + cover, every other PDF copied as it is.
@@ -1087,7 +1152,7 @@ def main():
                                 continue
                             except Exception as exc:
                                 print(f"[split] {f['filename']}: {type(exc).__name__}: {exc}", flush=True)
-                                summary["failed"].append(f'{f["filename"]} ({type(exc).__name__}: {exc})')
+                                summary["failed"].append(f["filename"])
                         stem, ext = os.path.splitext(f["filename"])
                         dst, n = Path(split_dir) / f["filename"], 2
                         while dst.exists():
@@ -1102,30 +1167,32 @@ def main():
                 s = st.session_state.split_summary
                 split_count = len(list(Path(split_dir).glob("*.pdf")))
                 st.success(
-                    f"✅ Split done: {s['reports']} report(s) cut from {s['collective'] - len(s['failed'])} "
-                    f"collective PDF(s), {s['covers']} cover page(s) and {s['whole']} PDF(s) copied "
-                    f"unchanged — {split_count} file(s). This ZIP is the complete set, so you only "
-                    f"need this one."
-                    + (f" {s['repeats']} identical copy(ies) from repeated emails were saved once."
+                    f"✅ Aufteilung fertig: {_n(s['reports'], 'Einzelbericht', 'Einzelberichte')}, "
+                    f"{_n(s['covers'], 'Deckblatt', 'Deckblätter')} und {s['whole']} weitere PDF(s) "
+                    f"unverändert – zusammen {_n(split_count, 'Datei', 'Dateien')}. Dieses ZIP enthält "
+                    f"alles, du brauchst nur dieses eine."
+                    + (f" {s['repeats']} Bericht(e) kamen mehrfach per E-Mail und sind nur einmal enthalten."
                        if s["repeats"] else "")
                 )
                 if s["failed"]:
                     st.markdown(
-                        f'<div class="warn-box">⚠️ {len(s["failed"])} PDF(s) could not be split and are in '
-                        f'the ZIP whole: ' + "; ".join(s["failed"]) + '</div>',
+                        f'<div class="warn-box">⚠️ {len(s["failed"])} PDF(s) konnten nicht aufgeteilt werden '
+                        f'und liegen vollständig im ZIP:<br>'
+                        + "<br>".join(f"• <strong>{escape(name)}</strong>" for name in s["failed"])
+                        + '</div>',
                         unsafe_allow_html=True,
                     )
                 st.download_button(
-                    label=f"⬇️  Download individual reports — {split_count} file(s) in ZIP",
+                    label=f"⬇️  Einzelberichte herunterladen – {_n(split_count, 'Datei', 'Dateien')} als ZIP",
                     data=_build_zip(split_dir),
-                    file_name="kone_reports_split.zip",
+                    file_name="kone_einzelberichte.zip",
                     mime="application/zip",
                     key="download_split",
                     on_click="ignore",
                 )
 
         st.markdown("---")
-        if st.button("🔄 Start New Batch"):
+        if st.button("🔄 Neue E-Mails verarbeiten"):
             if st.session_state.temp_dir and os.path.exists(st.session_state.temp_dir):
                 shutil.rmtree(st.session_state.temp_dir, ignore_errors=True)
             for k, v in _STATE_DEFAULTS.items():
@@ -1138,10 +1205,10 @@ def main():
         shared = st.session_state.shared_state
         total  = shared["total"] or len(st.session_state.jobs)
 
-        st.markdown("### ⏳ Downloading Reports…")
+        st.markdown("### ⏳ Berichte werden heruntergeladen …")
         st.markdown(
-            '<div class="info-box">🔄 Processing is running. '
-            'Please <strong>keep this tab open</strong> until complete.</div>',
+            '<div class="info-box">🔄 Die Verarbeitung läuft. Bitte lass dieses Fenster '
+            '<strong>geöffnet</strong>, bis sie fertig ist.</div>',
             unsafe_allow_html=True,
         )
 
@@ -1162,7 +1229,7 @@ def main():
             time.sleep(0.5)
 
         progress_bar.progress(1.0)
-        status_text.markdown("**✅ Done!**")
+        status_text.markdown("**✅ Fertig!**")
 
         if shared["results"]:
             with results_container.container():
@@ -1170,7 +1237,8 @@ def main():
                              width="stretch", hide_index=True)
 
         if shared.get("error"):
-            st.error(f"An unexpected error occurred: {shared['error']}")
+            st.error("Es ist ein unerwarteter Fehler aufgetreten. Bitte versuche es noch einmal "
+                     "oder melde das Problem.")
 
         st.session_state.done       = True
         st.session_state.processing = False
@@ -1178,10 +1246,10 @@ def main():
         return
 
     # ── UPLOAD state ─────────────────────────────────────────────────────────
-    st.markdown("### 📂 Upload .msg Files")
+    st.markdown("### 📂 E-Mails hochladen (.msg)")
 
     uploaded = st.file_uploader(
-        "Drag & drop your KONE service-update emails here (max 50)",
+        "KONE-Service-E-Mails hier ablegen (max. 50)",
         type=["msg"],
         accept_multiple_files=True,
         label_visibility="collapsed",
@@ -1192,14 +1260,14 @@ def main():
 
     if len(uploaded) > MAX_FILES:
         st.markdown(
-            f'<div class="warn-box">⚠️ You uploaded {len(uploaded)} files. '
-            f'Only the first {MAX_FILES} will be processed.</div>',
+            f'<div class="warn-box">⚠️ Du hast {len(uploaded)} Dateien hochgeladen. '
+            f'Verarbeitet werden nur die ersten {MAX_FILES}.</div>',
             unsafe_allow_html=True,
         )
         uploaded = uploaded[:MAX_FILES]
 
     # ── URL extraction preview ────────────────────────────────────────────────
-    st.markdown("### 📋 File Preview")
+    st.markdown("### 📋 Vorschau")
 
     jobs         = []
     preview_rows = []
@@ -1209,8 +1277,8 @@ def main():
         url     = extract_url(uf.getvalue())
         jobs.append((address, url, uf.name))
         preview_rows.append({
-            "MSG File":  uf.name,
-            "URL Found": "✓ Yes" if url else "✗ No",
+            "E-Mail":                uf.name,
+            "Bericht-Link gefunden": "✓ Ja" if url else "✗ Nein",
         })
 
     st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
@@ -1219,30 +1287,30 @@ def main():
     invalid_count = len(jobs) - len(valid_jobs)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Files Uploaded",  len(uploaded))
-    c2.metric("URLs Extracted",  len(valid_jobs))
-    c3.metric("No URL (skipped)", invalid_count)
+    c1.metric("Hochgeladen",              len(uploaded))
+    c2.metric("Links gefunden",           len(valid_jobs))
+    c3.metric("Ohne Link (übersprungen)", invalid_count)
 
     if invalid_count > 0:
         st.markdown(
-            f'<div class="warn-box">⚠️ {invalid_count} file(s) contain no KONE report link '
-            f'(Jobdetails / Statusinformatie) and will be skipped.</div>',
+            f'<div class="warn-box">⚠️ {invalid_count} Datei(en) enthalten keinen Link zu einem '
+            f'KONE-Bericht und werden übersprungen.</div>',
             unsafe_allow_html=True,
         )
 
     if not valid_jobs:
-        st.error("No valid URLs found. Make sure you're uploading KONE service emails "
-                 "(German 'Jobdetails' or Dutch 'Statusinformatie' report link).")
+        st.error("In keiner Datei wurde ein Link zu einem KONE-Bericht gefunden. "
+                 "Bitte lade die Service-E-Mails von KONE hoch.")
         return
 
     st.markdown("---")
-    start = st.button("🚀 Start Download", type="primary")
+    start = st.button("🚀 Download starten", type="primary")
 
     if start:
         temp_dir = tempfile.mkdtemp()
         shared_state = {
             "current": 0, "total": 0,
-            "status": "Starting…",
+            "status": "Wird gestartet …",
             "results": [], "done": False, "error": None,
         }
         st.session_state.processing   = True
